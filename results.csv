@@ -1,0 +1,4 @@
+scenario,scheduler,cell_throughput_Mbps,jain_fairness,prb_utilization,mean_latency_ms,p95_latency_ms
+full_buffer_fastfade,RoundRobin,236.51799527999958,0.7672508975170157,1.0,500.5,950.0499999999997
+full_buffer_fastfade,ProportionalFair,259.1603108639998,0.8761583756553023,1.0,500.5,950.0499999999997
+full_buffer_fastfade,GreedyThroughput,257.9927372399998,0.6779813743517663,1.0,500.5,950.0499999999997
