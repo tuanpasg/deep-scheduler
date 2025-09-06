@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-\"\"\"
+"""
 rl_mac_env.py (fairness-aware)
 Fixed-N=4 MAC RL environment with masking, demand-aware PRB projection,
 38.214-like TBS, and reward = throughput + fairness (Jain over EMA) - latency.
@@ -10,7 +10,7 @@ Reward (per TTI):
       - gamma * mean(HOL_ms_norm)
 
 CLI/trainer can set: alpha, beta, gamma, fairness_ema_rho.
-\"\"\"
+"""
 import math
 import numpy as np
 import gymnasium as gym
@@ -28,7 +28,7 @@ MCS_TABLE = [
 ]  # idx 0..28
 
 def tbs_38214_bytes(mcs_idx, n_prb, n_symb=14, n_layers=1, overhead_re_per_prb=18):
-    \"\"\"Pragmatic 38.214-like TBS (single codeword); returns BYTES for this TTI.\"\"\"
+    """Pragmatic 38.214-like TBS (single codeword); returns BYTES for this TTI."""
     if n_prb <= 0 or mcs_idx < 0:
         return 0
     mcs_idx = int(max(0, min(28, mcs_idx)))
@@ -105,12 +105,12 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
 # Environment
 # -----------------------------
 class MACSchedulerEnv(gym.Env):
-    \"\"\"
+    """
     Fixed N=4 with active_mask.
     Observation per UE: [load_norm, mcs_norm, (prev_prbs_norm?)] * 4 + [prb_budget_norm, active_mask(4)]
     Action: 4 non-negative scores -> PRBs via projection.
-    \"\"\"
-    metadata = {\"render_modes\": []}
+    """
+    metadata = {"render_modes": []}
 
     def __init__(self,
                  use_prev_prbs: bool = False,
@@ -124,8 +124,8 @@ class MACSchedulerEnv(gym.Env):
                  beta_fairness: float = 0.2,
                  gamma_latency: float = 0.05,
                  fairness_ema_rho: float = 0.9,
-                 traffic_profile: str = \"mixed\",
-                 fading_profile: str = \"fast\",
+                 traffic_profile: str = "mixed",
+                 fading_profile: str = "fast",
                  seed: int = 42):
         super().__init__()
         self.use_prev_prbs = use_prev_prbs
@@ -157,17 +157,17 @@ class MACSchedulerEnv(gym.Env):
         self.prev_prbs = np.zeros(4, dtype=int)
         self.active_mask = np.ones(4, dtype=int)
 
-        if self.fading_profile == \"fast\":
+        if self.fading_profile == "fast":
             self.mcs_mean = np.array([14, 18, 10, 22]); self.mcs_spread = 4
-        elif self.fading_profile == \"slow\":
+        elif self.fading_profile == "slow":
             self.mcs_mean = np.array([12, 16, 9, 20]); self.mcs_spread = 2
         else:
             self.mcs_mean = np.array([12, 18, 10, 22]); self.mcs_spread = 0
 
-        if self.traffic_profile == \"full_buffer\":
+        if self.traffic_profile == "full_buffer":
             self.arrival_bps = np.array([1e12, 1e12, 1e12, 1e12])
             self.period_ms = np.array([0, 0, 0, 0]); self.period_bytes = np.array([0, 0, 0, 0])
-        elif self.traffic_profile == \"mixed\":
+        elif self.traffic_profile == "mixed":
             self.arrival_bps = np.array([50e6, 0.0, 8e6, 15e6])
             self.period_ms = np.array([0, 20, 0, 0]); self.period_bytes = np.array([0, 80, 0, 0])
         else:  # poisson
@@ -217,16 +217,16 @@ class MACSchedulerEnv(gym.Env):
         self.t += 1
         terminated = False
         truncated = self.t >= self.duration_tti
-        info = {\"mcs\": mcs, \"arrivals\": arrivals, \"served_bytes\": served, \"prbs\": prbs,
-                \"backlog\": self.backlog.copy(), \"hol_ms\": self.hol_ms.copy(), \"jain\": jain,
-                \"thr_ema_mbps\": self.thr_ema_mbps.copy()}
+        info = {"mcs": mcs, "arrivals": arrivals, "served_bytes": served, "prbs": prbs,
+                "backlog": self.backlog.copy(), "hol_ms": self.hol_ms.copy(), "jain": jain,
+                "thr_ema_mbps": self.thr_ema_mbps.copy()}
         return self._get_obs(), float(reward), terminated, truncated, info
 
     def _get_obs(self):
         obs = []
         for i in range(4):
             load_norm = min(self.backlog[i] / 1e6, 10.0)
-            mcs_norm = getattr(self, \"_last_mcs\", np.zeros(4))[i] / 28.0 if hasattr(self, \"_last_mcs\") else 0.0
+            mcs_norm = getattr(self, "_last_mcs", np.zeros(4))[i] / 28.0 if hasattr(self, "_last_mcs") else 0.0
             obs.extend([load_norm, float(np.clip(mcs_norm, 0.0, 1.0))])
             if self.use_prev_prbs:
                 obs.append(float(self.prev_prbs[i]) / self.max_prb)

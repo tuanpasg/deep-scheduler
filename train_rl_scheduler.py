@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-\"\"\"
+"""
 train_rl_scheduler.py (fairness-aware)
 PPO trainer for rl_mac_env.MACSchedulerEnv.
 
 Example:
   python train_rl_scheduler.py --timesteps 2_000_000 --alpha 1.0 --beta 0.3 --gamma 0.05 --rho 0.9 --use_prev_prbs 0
-\"\"\"
+"""
 import argparse, os
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
@@ -30,31 +30,31 @@ def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, gamma, rho):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument(\"--timesteps\", type=int, default=1_000_000)
-    p.add_argument(\"--use_prev_prbs\", type=int, default=0)
-    p.add_argument(\"--profile\", type=str, default=\"mixed\", choices=[\"mixed\",\"poisson\",\"full_buffer\"])
-    p.add_argument(\"--fading\", type=str, default=\"fast\", choices=[\"fast\",\"slow\",\"static\"])
-    p.add_argument(\"--alpha\", type=float, default=1.0)
-    p.add_argument(\"--beta\", type=float, default=0.2)
-    p.add_argument(\"--gamma\", type=float, default=0.05)
-    p.add_argument(\"--rho\", type=float, default=0.9)
-    p.add_argument(\"--lr\", type=float, default=3e-4)
-    p.add_argument(\"--batch_size\", type=int, default=128)
-    p.add_argument(\"--n_steps\", type=int, default=2048)
-    p.add_argument(\"--ent_coef\", type=float, default=0.01)
-    p.add_argument(\"--save_dir\", type=str, default=\"runs/ppo_mac_fair\" )
-    p.add_argument(\"--seed\", type=int, default=42)
+    p.add_argument("--timesteps", type=int, default=1_000_000)
+    p.add_argument("--use_prev_prbs", type=int, default=0)
+    p.add_argument("--profile", type=str, default="mixed", choices=["mixed","poisson","full_buffer"])
+    p.add_argument("--fading", type=str, default="fast", choices=["fast","slow","static"])
+    p.add_argument("--alpha", type=float, default=1.0)
+    p.add_argument("--beta", type=float, default=0.2)
+    p.add_argument("--gamma", type=float, default=0.05)
+    p.add_argument("--rho", type=float, default=0.9)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--n_steps", type=int, default=2048)
+    p.add_argument("--ent_coef", type=float, default=0.01)
+    p.add_argument("--save_dir", type=str, default="runs/ppo_mac_fair" )
+    p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
-    logger = configure(args.save_dir, [\"stdout\",\"csv\",\"tensorboard\"])
+    logger = configure(args.save_dir, ["stdout","csv","tensorboard"])
 
     env = DummyVecEnv([make_env(bool(args.use_prev_prbs), args.profile, args.fading,
                                 args.seed, args.alpha, args.beta, args.gamma, args.rho)])
     env = VecMonitor(env)
 
     policy_kwargs = dict(net_arch=[128,128])
-    model = PPO(\"MlpPolicy\", env,
+    model = PPO("MlpPolicy", env,
                 learning_rate=args.lr,
                 n_steps=args.n_steps,
                 batch_size=args.batch_size,
@@ -63,9 +63,9 @@ def main():
                 policy_kwargs=policy_kwargs, verbose=1, seed=args.seed)
     model.set_logger(logger)
     model.learn(total_timesteps=args.timesteps)
-    model_path = os.path.join(args.save_dir, \"ppo_mac_scheduler.zip\")
+    model_path = os.path.join(args.save_dir, "ppo_mac_scheduler.zip")
     model.save(model_path)
-    print(f\"Saved model to: {model_path}\")
+    print(f"Saved model to: {model_path}")
 
-if __name__ == \"__main__\":
+if __name__ == "__main__":
     main()
