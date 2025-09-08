@@ -34,12 +34,12 @@ KEYS_DEFAULT = [
 
 def _safe_plot(df, xcol, ycol, title, out_png):
     if ycol not in df.columns or xcol not in df.columns:
-        print(f\"[skip] {ycol} (or {xcol}) not in CSV\")
+        print(f"[skip] {ycol} (or {xcol}) not in CSV")
         return False
     x = df[xcol].values
     y = df[ycol].values
     if len(x) == 0:
-        print(f\"[skip] {ycol}: empty series\")
+        print(f"[skip] {ycol}: empty series")
         return False
     plt.figure()
     plt.plot(x, y, linewidth=1.5)
@@ -50,7 +50,7 @@ def _safe_plot(df, xcol, ycol, title, out_png):
     plt.tight_layout()
     plt.savefig(out_png, dpi=150)
     plt.close()
-    print(f\"[ok] wrote {out_png}\")
+    print(f"[ok] wrote {out_png}")
     return True
 
 def _moving_avg(a, k=20):
@@ -62,12 +62,12 @@ def _moving_avg(a, k=20):
 
 def visualize_progress(progress_csv, outdir):
     df = pd.read_csv(progress_csv)
-    xcol = \"time/total_timesteps\" if \"time/total_timesteps\" in df.columns else df.index.name or \"index\"
-    if xcol == \"index\":
+    xcol = "time/total_timesteps" if "time/total_timesteps" in df.columns else df.index.name or "index"
+    if xcol == "index":
         df = df.reset_index()
 
     for key, title in KEYS_DEFAULT:
-        out_png = os.path.join(outdir, f\"{key.replace('/','_')}.png\")
+        out_png = os.path.join(outdir, f"{key.replace('/','_')}.png")
         _safe_plot(df, xcol, key, title, out_png)
 
     summary = {}
@@ -75,9 +75,9 @@ def visualize_progress(progress_csv, outdir):
         if key in df.columns and len(df[key]) > 0:
             summary[key] = df[key].iloc[-1]
     sum_df = pd.DataFrame([summary])
-    sum_csv = os.path.join(outdir, \"summary_progress_last.csv\")
+    sum_csv = os.path.join(outdir, "summary_progress_last.csv")
     sum_df.to_csv(sum_csv, index=False)
-    print(f\"[ok] wrote {sum_csv}\")
+    print(f"[ok] wrote {sum_csv}")
 
 def visualize_monitor(monitor_csv, outdir):
     df = pd.read_csv(monitor_csv, comment='#')
@@ -88,16 +88,16 @@ def visualize_monitor(monitor_csv, outdir):
         plt.plot(np.arange(len(r)), r, alpha=0.4, linewidth=1.0, label='episode reward')
         if len(ma) > 0:
             plt.plot(np.arange(len(ma)) + (len(r)-len(ma)), ma, linewidth=2.0, label='moving avg')
-        plt.title(\"Episode Reward (Monitor)\")
-        plt.xlabel(\"Episode\")
-        plt.ylabel(\"Reward\")
+        plt.title("Episode Reward (Monitor)")
+        plt.xlabel("Episode")
+        plt.ylabel("Reward")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        out_png = os.path.join(outdir, \"monitor_episode_reward.png\")
+        out_png = os.path.join(outdir, "monitor_episode_reward.png")
         plt.savefig(out_png, dpi=150)
         plt.close()
-        print(f\"[ok] wrote {out_png}\")
+        print(f"[ok] wrote {out_png}")
 
     if 'l' in df.columns:
         l = df['l'].values
@@ -106,33 +106,33 @@ def visualize_monitor(monitor_csv, outdir):
         plt.plot(np.arange(len(l)), l, alpha=0.4, linewidth=1.0, label='episode length')
         if len(ma) > 0:
             plt.plot(np.arange(len(ma)) + (len(l)-len(ma)), ma, linewidth=2.0, label='moving avg')
-        plt.title(\"Episode Length (Monitor)\")
-        plt.xlabel(\"Episode\")
-        plt.ylabel(\"Length (steps)\")
+        plt.title("Episode Length (Monitor)")
+        plt.xlabel("Episode")
+        plt.ylabel("Length (steps)")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        out_png = os.path.join(outdir, \"monitor_episode_length.png\")
+        out_png = os.path.join(outdir, "monitor_episode_length.png")
         plt.savefig(out_png, dpi=150)
         plt.close()
-        print(f\"[ok] wrote {out_png}\")
+        print(f"[ok] wrote {out_png}")
 
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument(\"--logdir\", type=str, required=True, help=\"Directory containing progress.csv/monitor.csv\")
-    ap.add_argument(\"--outdir\", type=str, default=\"plots\", help=\"Directory to save PNGs and summary CSVs\")
+    ap.add_argument("--logdir", type=str, required=True, help="Directory containing progress.csv/monitor.csv")
+    ap.add_argument("--outdir", type=str, default="plots", help="Directory to save PNGs and summary CSVs")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    progress_csv = os.path.join(args.logdir, \"progress.csv\")
-    monitor_csv = os.path.join(args.logdir, \"monitor.csv\")
+    progress_csv = os.path.join(args.logdir, "progress.csv")
+    monitor_csv = os.path.join(args.logdir, "monitor.csv")
 
     if os.path.exists(progress_csv):
         visualize_progress(progress_csv, args.outdir)
     else:
-        print(f\"[warn] {progress_csv} not found\")
+        print(f"[warn] {progress_csv} not found")
 
     if os.path.exists(monitor_csv):
         visualize_monitor(monitor_csv, args.outdir)
@@ -144,7 +144,7 @@ def main():
                 visualize_monitor(os.path.join(args.logdir, fname), args.outdir)
                 found = True
         if not found:
-            print(f\"[warn] {monitor_csv} not found and no monitor_*.csv found in {args.logdir}\")
+            print(f"[warn] {monitor_csv} not found and no monitor_*.csv found in {args.logdir}")
 
 if __name__ == '__main__':
     main()

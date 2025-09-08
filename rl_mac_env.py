@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-\"\"\"rl_mac_env.py (updated)
-Fixed-N=4 MAC RL environment with masking, demand-aware PRB projection,
-38.214-like TBS, and reward = throughput + fairness (Jain over EMA) - latency.
-
-This updated version adds 'cell_tput_Mb' and 'mean_hol_ms' into the info dict each step,
-so Monitor(...) can record them per-episode with info_keywords.
-\"\"\"
 import math
 import numpy as np
 import gymnasium as gym

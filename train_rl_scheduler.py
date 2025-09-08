@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-\"\"\"train_rl_scheduler.py (updated)
-Wraps the env with Monitor(...) so a monitor CSV with KPI columns is produced.
-\"\"\"
 import argparse
 import os
 from stable_baselines3 import PPO
