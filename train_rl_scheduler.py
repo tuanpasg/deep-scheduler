@@ -22,7 +22,8 @@ def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, gamma, rho, save
             fairness_ema_rho=rho,
             seed=seed
         )
-        monitor_path = os.path.join(save_dir, f"monitor_seed{seed}.csv")
+        # monitor_path = os.path.join(save_dir, f"monitor_seed{seed}.csv")
+        monitor_path = os.path.join(save_dir, f"monitor.csv")
         env = Monitor(env, filename=monitor_path, info_keywords=('jain','cell_tput_Mb','mean_hol_ms'))
         return env
     return _thunk
