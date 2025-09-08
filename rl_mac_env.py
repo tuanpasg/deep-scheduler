@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
-"""
-rl_mac_env.py (fairness-aware)
+\"\"\"rl_mac_env.py (updated)
 Fixed-N=4 MAC RL environment with masking, demand-aware PRB projection,
 38.214-like TBS, and reward = throughput + fairness (Jain over EMA) - latency.
 
-Reward (per TTI):
-  r_t = alpha * sum(served_bits_Mb)
-      + beta  * Jain(throughput_ema_per_UE)
-      - gamma * mean(HOL_ms_norm)
-
-CLI/trainer can set: alpha, beta, gamma, fairness_ema_rho.
-"""
+This updated version adds 'cell_tput_Mb' and 'mean_hol_ms' into the info dict each step,
+so Monitor(...) can record them per-episode with info_keywords.
+\"\"\"
 import math
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# -----------------------------
-# MCS table (Qm, R*1024) simplified 38.214-like
-# -----------------------------
+# Simplified MCS table (Qm, R*1024)
 MCS_TABLE = [
-    (2, 120), (2, 157), (2, 193), (2, 251), (2, 308), (2, 379),
-    (4, 449), (4, 526), (4, 602), (4, 679), (6, 340), (6, 378),
-    (6, 434), (6, 490), (6, 553), (6, 616), (6, 658), (8, 438),
-    (8, 466), (8, 517), (8, 567), (8, 616), (8, 666), (8, 719),
-    (8, 772), (8, 822), (8, 873), (8, 910), (8, 948)
-]  # idx 0..28
+    (2,120),(2,157),(2,193),(2,251),(2,308),(2,379),
+    (4,449),(4,526),(4,602),(4,679),(6,340),(6,378),
+    (6,434),(6,490),(6,553),(6,616),(6,658),(8,438),
+    (8,466),(8,517),(8,567),(8,616),(8,666),(8,719),
+    (8,772),(8,822),(8,873),(8,910),(8,948)
+]
 
 def tbs_38214_bytes(mcs_idx, n_prb, n_symb=14, n_layers=1, overhead_re_per_prb=18):
-    """Pragmatic 38.214-like TBS (single codeword); returns BYTES for this TTI."""
     if n_prb <= 0 or mcs_idx < 0:
         return 0
     mcs_idx = int(max(0, min(28, mcs_idx)))
@@ -56,9 +48,6 @@ def jain_fairness(values):
     den = len(v) * (v**2).sum() + 1e-12
     return float(num / den)
 
-# -----------------------------
-# Projection: scores -> integer PRBs (mask + cap + redistribute)
-# -----------------------------
 def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active_mask, n_symb=14, overhead=18):
     scores = np.array(scores, dtype=np.float64) * active_mask
     prb_budget = int(prb_budget)
@@ -80,7 +69,6 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
                 prbs[k] += 1
                 leftover -= 1
 
-    # Demand-aware caps
     bpp = np.array([bytes_per_prb(int(m), n_symb, overhead) for m in ue_mcs_idx], dtype=float)
     caps = np.ceil(np.divide(ue_load_bytes, np.maximum(bpp, 1e-9))).astype(int)
     caps = np.maximum(0, caps) * active_mask.astype(int)
@@ -101,16 +89,8 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
             rem -= 1
     return prbs.astype(int)
 
-# -----------------------------
-# Environment
-# -----------------------------
 class MACSchedulerEnv(gym.Env):
-    """
-    Fixed N=4 with active_mask.
-    Observation per UE: [load_norm, mcs_norm, (prev_prbs_norm?)] * 4 + [prb_budget_norm, active_mask(4)]
-    Action: 4 non-negative scores -> PRBs via projection.
-    """
-    metadata = {"render_modes": []}
+    metadata = {'render_modes': []}
 
     def __init__(self,
                  use_prev_prbs: bool = False,
@@ -124,8 +104,8 @@ class MACSchedulerEnv(gym.Env):
                  beta_fairness: float = 0.2,
                  gamma_latency: float = 0.05,
                  fairness_ema_rho: float = 0.9,
-                 traffic_profile: str = "mixed",
-                 fading_profile: str = "fast",
+                 traffic_profile: str = 'mixed',
+                 fading_profile: str = 'fast',
                  seed: int = 42):
         super().__init__()
         self.use_prev_prbs = use_prev_prbs
@@ -157,21 +137,21 @@ class MACSchedulerEnv(gym.Env):
         self.prev_prbs = np.zeros(4, dtype=int)
         self.active_mask = np.ones(4, dtype=int)
 
-        if self.fading_profile == "fast":
-            self.mcs_mean = np.array([14, 18, 10, 22]); self.mcs_spread = 4
-        elif self.fading_profile == "slow":
-            self.mcs_mean = np.array([12, 16, 9, 20]); self.mcs_spread = 2
+        if self.fading_profile == 'fast':
+            self.mcs_mean = np.array([14,18,10,22]); self.mcs_spread = 4
+        elif self.fading_profile == 'slow':
+            self.mcs_mean = np.array([12,16,9,20]); self.mcs_spread = 2
         else:
-            self.mcs_mean = np.array([12, 18, 10, 22]); self.mcs_spread = 0
+            self.mcs_mean = np.array([12,18,10,22]); self.mcs_spread = 0
 
-        if self.traffic_profile == "full_buffer":
-            self.arrival_bps = np.array([1e12, 1e12, 1e12, 1e12])
-            self.period_ms = np.array([0, 0, 0, 0]); self.period_bytes = np.array([0, 0, 0, 0])
-        elif self.traffic_profile == "mixed":
-            self.arrival_bps = np.array([50e6, 0.0, 8e6, 15e6])
-            self.period_ms = np.array([0, 20, 0, 0]); self.period_bytes = np.array([0, 80, 0, 0])
-        else:  # poisson
-            self.arrival_bps = np.array([40e6, 10e6, 12e6, 20e6])
+        if self.traffic_profile == 'full_buffer':
+            self.arrival_bps = np.array([1e12,1e12,1e12,1e12])
+            self.period_ms = np.array([0,0,0,0]); self.period_bytes = np.array([0,0,0,0])
+        elif self.traffic_profile == 'mixed':
+            self.arrival_bps = np.array([50e6,0.0,8e6,15e6])
+            self.period_ms = np.array([0,20,0,0]); self.period_bytes = np.array([0,80,0,0])
+        else:
+            self.arrival_bps = np.array([40e6,10e6,12e6,20e6])
             self.period_ms = np.zeros(4, dtype=int); self.period_bytes = np.zeros(4, dtype=int)
 
         self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
@@ -185,17 +165,19 @@ class MACSchedulerEnv(gym.Env):
         return self._get_obs(), {}
 
     def step(self, action):
+        # 1) Channel sample
         mcs = self._sample_mcs()
+        # 2) Arrivals
         arrivals = self._arrivals()
         self.backlog += arrivals
-
+        # 3) HOL update
         self.hol_ms[self.backlog > 0] += self.tti_ms
         self.hol_ms[self.backlog <= 0] = 0.0
-
+        # 4) Project action
         scores = np.clip(np.array(action, dtype=float), 0.0, None)
         prbs = project_scores_to_prbs(scores, self.max_prb, self.backlog, mcs, self.active_mask,
                                       n_symb=self.n_symb, overhead=self.overhead)
-
+        # 5) Serve
         served = np.zeros(4, dtype=float)
         for i in range(4):
             tbs = tbs_38214_bytes(int(mcs[i]), int(prbs[i]), n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
@@ -203,30 +185,42 @@ class MACSchedulerEnv(gym.Env):
             self.backlog[i] -= served[i]
             if self.backlog[i] <= 0:
                 self.hol_ms[i] = 0.0
-
+        # 6) Fairness EMA
         duration_s = self.tti_ms / 1000.0
         inst_mbps = (served * 8.0) / 1e6 / max(duration_s, 1e-9)
         self.thr_ema_mbps = self.rho * self.thr_ema_mbps + (1.0 - self.rho) * inst_mbps
-
+        # 7) Reward components
         served_bits = served.sum() * 8.0
         hol_norm = np.minimum(self.hol_ms / 200.0, 1.0)
         jain = jain_fairness(self.thr_ema_mbps)
         reward = self.alpha * (served_bits / 1e6) + self.beta * jain - self.gamma * float(np.mean(hol_norm))
-
+        # 8) KPI scalars for Monitor
+        cell_tput_Mb = float(served_bits / 1e6)  # Mb served this TTI
+        mean_hol_ms = float(np.mean(self.hol_ms))
+        # 9) finalize
         self.prev_prbs = prbs
         self.t += 1
         terminated = False
         truncated = self.t >= self.duration_tti
-        info = {"mcs": mcs, "arrivals": arrivals, "served_bytes": served, "prbs": prbs,
-                "backlog": self.backlog.copy(), "hol_ms": self.hol_ms.copy(), "jain": jain,
-                "thr_ema_mbps": self.thr_ema_mbps.copy()}
+        info = {
+            'mcs': mcs,
+            'arrivals': arrivals,
+            'served_bytes': served,
+            'prbs': prbs,
+            'backlog': self.backlog.copy(),
+            'hol_ms': self.hol_ms.copy(),
+            'jain': jain,
+            'thr_ema_mbps': self.thr_ema_mbps.copy(),
+            'cell_tput_Mb': cell_tput_Mb,
+            'mean_hol_ms': mean_hol_ms
+        }
         return self._get_obs(), float(reward), terminated, truncated, info
 
     def _get_obs(self):
         obs = []
         for i in range(4):
             load_norm = min(self.backlog[i] / 1e6, 10.0)
-            mcs_norm = getattr(self, "_last_mcs", np.zeros(4))[i] / 28.0 if hasattr(self, "_last_mcs") else 0.0
+            mcs_norm = getattr(self, '_last_mcs', np.zeros(4))[i] / 28.0 if hasattr(self, '_last_mcs') else 0.0
             obs.extend([load_norm, float(np.clip(mcs_norm, 0.0, 1.0))])
             if self.use_prev_prbs:
                 obs.append(float(self.prev_prbs[i]) / self.max_prb)

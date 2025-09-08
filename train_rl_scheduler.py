@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""
-train_rl_scheduler.py (fairness-aware)
-PPO trainer for rl_mac_env.MACSchedulerEnv.
-
-Example:
-  python train_rl_scheduler.py --timesteps 2_000_000 --alpha 1.0 --beta 0.3 --gamma 0.05 --rho 0.9 --use_prev_prbs 0
-"""
-import argparse, os
+\"\"\"train_rl_scheduler.py (updated)
+Wraps the env with Monitor(...) so a monitor CSV with KPI columns is produced.
+\"\"\"
+import argparse
+import os
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.monitor import Monitor
+
 from rl_mac_env import MACSchedulerEnv
 
-def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, gamma, rho):
+def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, gamma, rho, save_dir):
     def _thunk():
-        return MACSchedulerEnv(
+        env = MACSchedulerEnv(
             use_prev_prbs=use_prev_prbs,
             traffic_profile=profile,
             fading_profile=fading,
@@ -26,6 +25,9 @@ def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, gamma, rho):
             fairness_ema_rho=rho,
             seed=seed
         )
+        monitor_path = os.path.join(save_dir, f"monitor_seed{seed}.csv")
+        env = Monitor(env, filename=monitor_path, info_keywords=('jain','cell_tput_Mb','mean_hol_ms'))
+        return env
     return _thunk
 
 def main():
@@ -42,7 +44,7 @@ def main():
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--n_steps", type=int, default=2048)
     p.add_argument("--ent_coef", type=float, default=0.01)
-    p.add_argument("--save_dir", type=str, default="runs/ppo_mac_fair" )
+    p.add_argument("--save_dir", type=str, default="runs/ppo_mac_fair")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
@@ -50,7 +52,7 @@ def main():
     logger = configure(args.save_dir, ["stdout","csv","tensorboard"])
 
     env = DummyVecEnv([make_env(bool(args.use_prev_prbs), args.profile, args.fading,
-                                args.seed, args.alpha, args.beta, args.gamma, args.rho)])
+                                args.seed, args.alpha, args.beta, args.gamma, args.rho, args.save_dir)])
     env = VecMonitor(env)
 
     policy_kwargs = dict(net_arch=[128,128])
@@ -62,6 +64,7 @@ def main():
                 gamma=0.99, gae_lambda=0.95, clip_range=0.2, vf_coef=0.5,
                 policy_kwargs=policy_kwargs, verbose=1, seed=args.seed)
     model.set_logger(logger)
+
     model.learn(total_timesteps=args.timesteps)
     model_path = os.path.join(args.save_dir, "ppo_mac_scheduler.zip")
     model.save(model_path)
