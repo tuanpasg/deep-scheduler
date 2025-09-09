@@ -53,7 +53,7 @@ def main():
                                 args.seed, args.alpha, args.beta, args.gamma, args.rho, args.save_dir)])
     env = VecMonitor(env)
 
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.)
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
     
     policy_kwargs = dict(net_arch=[128,128])
     model = PPO("MlpPolicy", env,
