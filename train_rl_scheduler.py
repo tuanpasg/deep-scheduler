@@ -2,7 +2,7 @@
 import argparse
 import os
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 
@@ -53,6 +53,8 @@ def main():
                                 args.seed, args.alpha, args.beta, args.gamma, args.rho, args.save_dir)])
     env = VecMonitor(env)
 
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.)
+    
     policy_kwargs = dict(net_arch=[128,128])
     model = PPO("MlpPolicy", env,
                 learning_rate=args.lr,
