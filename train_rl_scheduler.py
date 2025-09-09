@@ -61,6 +61,8 @@ def main():
                 n_steps=args.n_steps,
                 batch_size=args.batch_size,
                 ent_coef=args.ent_coef,
+                vf_coef=1,
+                n_epochs=10,
                 gamma=0.99, gae_lambda=0.95, clip_range=0.2, vf_coef=0.5,
                 policy_kwargs=policy_kwargs, verbose=1, seed=args.seed)
     model.set_logger(logger)
