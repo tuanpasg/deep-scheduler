@@ -55,7 +55,8 @@ def main():
 
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
     
-    policy_kwargs = dict(net_arch=[128,128])
+    # policy_kwargs = dict(net_arch=[128,128])
+    policy_kwargs = dict(net_arch=[dict(pi=[256,256], vf=[256,256])])
     model = PPO("MlpPolicy", env,
                 learning_rate=args.lr,
                 n_steps=args.n_steps,
