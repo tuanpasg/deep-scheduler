@@ -2,13 +2,13 @@
 import argparse
 import os
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 
 from rl_mac_env import MACSchedulerEnv
 
-def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, gamma, rho, save_dir):
+def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, rho, save_dir):
     def _thunk():
         env = MACSchedulerEnv(
             use_prev_prbs=use_prev_prbs,
@@ -18,13 +18,13 @@ def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, gamma, rho, save
             prb_budget=273,
             alpha_throughput=alpha,
             beta_fairness=beta,
-            gamma_latency=gamma,
+            gamma_latency=0.0,   # ignored in env (no HOL)
             fairness_ema_rho=rho,
             seed=seed
         )
-        # monitor_path = os.path.join(save_dir, f"monitor_seed{seed}.csv")
-        monitor_path = os.path.join(save_dir, f"monitor.csv")
-        env = Monitor(env, filename=monitor_path, info_keywords=('jain','cell_tput_Mb','mean_hol_ms'))
+        monitor_path = os.path.join(save_dir, "monitor.csv")
+        # Drop mean_hol_ms (removed from env); keep jain & throughput per TTI
+        env = Monitor(env, filename=monitor_path, info_keywords=('jain','cell_tput_Mb'))
         return env
     return _thunk
 
@@ -36,7 +36,6 @@ def main():
     p.add_argument("--fading", type=str, default="fast", choices=["fast","slow","static"])
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=0.2)
-    p.add_argument("--gamma", type=float, default=0.05)
     p.add_argument("--rho", type=float, default=0.9)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--batch_size", type=int, default=128)
@@ -49,12 +48,11 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     logger = configure(args.save_dir, ["stdout","csv","tensorboard"])
 
+    # No VecNormalize: observations are already normalized in-env; reward is O(1)
     env = DummyVecEnv([make_env(bool(args.use_prev_prbs), args.profile, args.fading,
-                                args.seed, args.alpha, args.beta, args.gamma, args.rho, args.save_dir)])
+                                args.seed, args.alpha, args.beta, args.rho, args.save_dir)])
     env = VecMonitor(env)
 
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.)
-    
     policy_kwargs = dict(net_arch=[128,128])
     model = PPO("MlpPolicy", env,
                 learning_rate=args.lr,
