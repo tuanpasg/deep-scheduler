@@ -44,49 +44,77 @@ def jain_fairness(values):
     den = len(v) * (v**2).sum() + 1e-12
     return float(num / den)
 
-def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active_mask, n_symb=14, overhead=18):
-    """Allocate PRBs proportional to non-negative scores, honoring capacity/backlog caps."""
-    scores = np.array(scores, dtype=np.float64) * active_mask
+def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active_mask,
+                           n_symb=14, overhead=18, training_mode=False):
+    """
+    Returns:
+      prbs_out: PRBs that will actually be allocated/served (size 4, int)
+      prbs_pre: PRBs computed from scores before masking/redistribution (size 4, int)
+      wasted_prbs: int number of PRBs assigned to inactive UEs (prbs_pre * (1-active_mask))
+    Behavior:
+      - training_mode=False: existing safe behavior (mask early or redistribute as before)
+      - training_mode=True: compute prbs_pre normally, then prbs_out = prbs_pre * active_mask (no redistribution)
+    """
+    scores = np.array(scores, dtype=np.float64)
     prb_budget = int(prb_budget)
     if prb_budget <= 0 or np.all(scores <= 0):
-        return np.zeros(4, dtype=int)
+        return np.zeros(4, dtype=int), np.zeros(4, dtype=int), 0
 
     total = scores.sum()
     fracs = scores / total if total > 0 else np.zeros_like(scores)
     raw = fracs * prb_budget
-    prbs = np.floor(raw).astype(int)
+    prbs_pre = np.floor(raw).astype(int)
 
-    leftover = prb_budget - prbs.sum()
+    # ensure sum(prbs_pre) == prb_budget by distributing leftover (same as before)
+    leftover = prb_budget - prbs_pre.sum()
     if leftover > 0:
-        rema = raw - prbs
+        rema = raw - prbs_pre
         for k in np.argsort(-rema):
             if leftover == 0:
                 break
-            if active_mask[k] > 0:
-                prbs[k] += 1
-                leftover -= 1
+            prbs_pre[k] += 1
+            leftover -= 1
 
-    # ---- robust caps: avoid tiny bytes-per-PRB leading to huge caps
+    # robust caps (backlog-based): as before
     bpp_raw = np.array([bytes_per_prb(int(m), n_symb, overhead) for m in ue_mcs_idx], dtype=float)
-    bpp = np.maximum(bpp_raw, 4.0)  # min 4 bytes/PRB
+    bpp = np.maximum(bpp_raw, 4.0)
     caps = np.minimum(np.ceil(np.divide(ue_load_bytes, bpp)).astype(int), prb_budget)
-    caps = np.maximum(0, caps) * active_mask.astype(int)
+    caps = np.maximum(0, caps)  # **do not multiply by active_mask yet**
 
-    prbs = np.minimum(prbs, caps)
+    # clip pre-alloc to caps (a UE cannot use more PRBs than its backlog allows)
+    prbs_pre = np.minimum(prbs_pre, caps)
 
-    rem = prb_budget - int(prbs.sum())
-    if rem > 0:
-        remaining = caps - prbs
-        priority = (raw - prbs) + 1e-6 * (ue_load_bytes * bpp)
-        while rem > 0:
-            elig = np.where(remaining > 0)[0]
-            if elig.size == 0:
-                break
-            j = elig[np.argmax(priority[elig])]
-            prbs[j] += 1
-            remaining[j] -= 1
-            rem -= 1
-    return prbs.astype(int)
+    if training_mode:
+        # train-mode: do NOT redistribute PRBs intended for inactive UEs
+        prbs_out = prbs_pre * active_mask.astype(int)   # lost prbs vanish
+        wasted_prbs = int((prbs_pre * (1 - active_mask)).sum())
+    else:
+        # deployment: mask scores early / redistribute as before (safe behavior)
+        # Here we mimic previous behavior: zero scores, compute allocation with caps+active_mask and redistribution
+        # Option A: emulate original: recalc using masked scores (simpler)
+        scores_masked = scores * active_mask
+        total2 = scores_masked.sum()
+        if total2 <= 0:
+            prbs_out = np.zeros(4, dtype=int)
+        else:
+            raw2 = (scores_masked / total2) * prb_budget
+            prbs_out = np.floor(raw2).astype(int)
+            leftover2 = prb_budget - prbs_out.sum()
+            if leftover2 > 0:
+                rema2 = raw2 - prbs_out
+                for k in np.argsort(-rema2):
+                    if leftover2 == 0:
+                        break
+                    if active_mask[k] > 0:
+                        prbs_out[k] += 1
+                        leftover2 -= 1
+            # enforce caps & active mask
+            caps_masked = caps * active_mask.astype(int)
+            prbs_out = np.minimum(prbs_out, caps_masked)
+
+        wasted_prbs = int((prbs_pre * (1 - active_mask)).sum())  # for bookkeeping
+
+    return prbs_out.astype(int), prbs_pre.astype(int), wasted_prbs
 
 # ----------------------
 # Environment
@@ -108,7 +136,9 @@ class MACSchedulerEnv(gym.Env):
                  fairness_ema_rho: float = 0.9,
                  traffic_profile: str = 'mixed',
                  fading_profile: str = 'fast',
-                 seed: int = 42):
+                 seed: int = 42,
+                 training_mode=True):
+        
         super().__init__()
         self.use_prev_prbs = use_prev_prbs
         self.tti_ms = tti_ms
@@ -122,6 +152,7 @@ class MACSchedulerEnv(gym.Env):
         self.traffic_profile = traffic_profile
         self.fading_profile = fading_profile
         self.rng = np.random.default_rng(seed)
+        self.training_mode = training_mode
 
         # Observation: per-UE [backlog_norm, mcs_norm, (prev_prbs_norm if enabled)] + [prb_budget_norm] + [active_mask(4)]
         # All features are in [0,1].
@@ -189,12 +220,14 @@ class MACSchedulerEnv(gym.Env):
         self.backlog += arrivals
         # 3) Project action -> PRBs
         scores = np.clip(np.array(action, dtype=float), 0.0, 1.0)
-        prbs = project_scores_to_prbs(scores, self.max_prb, self.backlog, mcs, self.active_mask,
-                                      n_symb=self.n_symb, overhead=self.overhead)
+        prbs_out, prbs_pre, wasted_prbs = project_scores_to_prbs(scores, self.max_prb,
+                                                        self.backlog, mcs, self.active_mask,
+                                                        n_symb=self.n_symb, overhead=self.overhead,
+                                                        training_mode=self.training_mode)
         # 4) Serve
         served = np.zeros(4, dtype=float)
         for i in range(4):
-            tbs = tbs_38214_bytes(int(mcs[i]), int(prbs[i]), n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
+            tbs = tbs_38214_bytes(int(mcs[i]), int(prbs_out[i]), n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
             s = min(self.backlog[i], tbs)
             served[i] = s
             self.backlog[i] -= s
@@ -211,20 +244,29 @@ class MACSchedulerEnv(gym.Env):
         reward = self.alpha * throughput_norm + self.beta * jain
 
         # 7) Finalize
-        self.prev_prbs = prbs
+        self.prev_prbs = prbs_out
         self.t += 1
         terminated = False
         truncated = self.t >= self.duration_tti
+
+        bpp_raw = np.array([bytes_per_prb(int(m), self.n_symb, self.overhead) for m in mcs], dtype=float)
+        bpp = np.maximum(bpp_raw, 4.0)
+        wasted_prbs_array = (prbs_pre - prbs_out).clip(min=0)
+        wasted_bytes = float((wasted_prbs_array * bpp).sum())
+
         info = {
             'mcs': mcs,
             'arrivals': arrivals,
             'served_bytes': served,
-            'prbs': prbs,
+            'prbs': prbs_out,
             'backlog': self.backlog.copy(),
             'jain': jain,
             'thr_ema_mbps': self.thr_ema_mbps.copy(),
             'cell_tput_Mb': float(served_mb_tti),
+            'wasted_prbs': int(wasted_prbs),
+            'wasted_bytes': wasted_bytes
         }
+
         return self._get_obs(), float(reward), terminated, truncated, info
 
     # ----------------------
