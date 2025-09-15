@@ -119,6 +119,9 @@ def derive_kpi_from_monitor(mon_files, outdir):
     # Create a proxy x-axis: episode index across concatenated files
     x = np.arange(len(mon))
 
+    # Prepare summary collector before any conditional writes
+    summary = {}
+
     # Plot if available
     if have_jain:
         safe_plot(x, mon["jain"].values, "Jain Fairness (episode)", "episode", "jain",
@@ -137,7 +140,6 @@ def derive_kpi_from_monitor(mon_files, outdir):
         summary["kpi/wasted_prbs(last_episode)"] = int(mon["wasted_prbs"].iloc[-1])
 
     # Also write a summary CSV of last values
-    summary = {}
     if have_jain: summary["kpi/jain_mean(last_episode)"] = float(mon["jain"].iloc[-1])
     if have_tput: summary["kpi/cell_tput_Mb_per_tti(last_episode)"] = float(mon["cell_tput_Mb"].iloc[-1])
     if have_lat:  summary["kpi/mean_latency_ms(last_episode)"] = float(mon["mean_hol_ms"].iloc[-1])
