@@ -115,7 +115,7 @@ def derive_kpi_from_monitor(mon_files, outdir):
     have_jain = "jain" in mon.columns
     have_tput = "cell_tput_Mb" in mon.columns
     have_lat  = "mean_hol_ms" in mon.columns
-
+    have_waste = "wasted_prbs" in mon.columns
     # Create a proxy x-axis: episode index across concatenated files
     x = np.arange(len(mon))
 
@@ -129,6 +129,12 @@ def derive_kpi_from_monitor(mon_files, outdir):
     if have_lat:
         safe_plot(x, mon["mean_hol_ms"].values, "Mean HOL Latency (episode)",
                   "episode", "ms", os.path.join(outdir, "kpi_latency_from_monitor.png"))
+
+    if have_waste:
+        safe_plot(x, mon["wasted_prbs"].values, "Wasted PRBs per Episode",
+              "episode", "wasted_prbs", os.path.join(outdir, "kpi_wasted_prbs_from_monitor.png"))
+        # also write last value into summary if desired
+        summary["kpi/wasted_prbs(last_episode)"] = int(mon["wasted_prbs"].iloc[-1])
 
     # Also write a summary CSV of last values
     summary = {}

@@ -231,6 +231,7 @@ class MACSchedulerEnv(gym.Env):
             s = min(self.backlog[i], tbs)
             served[i] = s
             self.backlog[i] -= s
+        self.active_mask = ((self.backlog > 0).astype(int))
 
         # 5) Fairness EMA (Mb/s)
         duration_s = self.tti_ms / 1000.0
@@ -303,6 +304,6 @@ class MACSchedulerEnv(gym.Env):
             if self.period_ms[i] > 0 and (self.t % self.period_ms[i] == 0):
                 arr[i] += self.period_bytes[i]
         # Active if backlog will be >0 this TTI (after adding arrivals)
-        future_backlog = self.backlog + arr
-        self.active_mask = ((future_backlog > 0).astype(int))
+        # future_backlog = self.backlog + arr
+        # self.active_mask = ((future_backlog > 0).astype(int))
         return arr

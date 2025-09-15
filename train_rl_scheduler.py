@@ -8,7 +8,7 @@ from stable_baselines3.common.monitor import Monitor
 
 from rl_mac_env import MACSchedulerEnv
 
-def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, rho, save_dir):
+def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, rho, save_dir, training_mode):
     def _thunk():
         env = MACSchedulerEnv(
             use_prev_prbs=use_prev_prbs,
@@ -20,11 +20,12 @@ def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, rho, save_dir):
             beta_fairness=beta,
             gamma_latency=0.0,   # ignored in env (no HOL)
             fairness_ema_rho=rho,
-            seed=seed
+            seed=seed,
+            training_mode=training_mode
         )
         monitor_path = os.path.join(save_dir, "monitor.csv")
         # Drop mean_hol_ms (removed from env); keep jain & throughput per TTI
-        env = Monitor(env, filename=monitor_path, info_keywords=('jain','cell_tput_Mb'))
+        env = Monitor(env, filename=monitor_path, info_keywords=('jain','cell_tput_Mb','wasted_prbs'))
         return env
     return _thunk
 
@@ -43,6 +44,8 @@ def main():
     p.add_argument("--ent_coef", type=float, default=0.01)
     p.add_argument("--save_dir", type=str, default="runs/ppo_mac_fair")
     p.add_argument("--seed", type=int, default=42)
+    # training_mode: 1=train behavior (no redistribution to inactive UEs), 0=deploy behavior
+    p.add_argument("--training_mode", type=int, default=1)
     args = p.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -50,7 +53,8 @@ def main():
 
     # No VecNormalize: observations are already normalized in-env; reward is O(1)
     env = DummyVecEnv([make_env(bool(args.use_prev_prbs), args.profile, args.fading,
-                                args.seed, args.alpha, args.beta, args.rho, args.save_dir)])
+                                args.seed, args.alpha, args.beta, args.rho, args.save_dir,
+                                bool(args.training_mode))])
     env = VecMonitor(env)
 
     policy_kwargs = dict(net_arch=[128,128])
@@ -59,8 +63,7 @@ def main():
                 n_steps=args.n_steps,
                 batch_size=args.batch_size,
                 ent_coef=args.ent_coef,
-                n_epochs=10,
-                gamma=0.99, gae_lambda=0.95, clip_range=0.2, vf_coef=1.0,
+                gamma=0.99, gae_lambda=0.95, clip_range=0.2, vf_coef=0.5,
                 policy_kwargs=policy_kwargs, verbose=1, seed=args.seed)
     model.set_logger(logger)
 
