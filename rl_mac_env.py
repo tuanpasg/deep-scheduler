@@ -209,42 +209,48 @@ class MACSchedulerEnv(gym.Env):
         self.t = 0
         self.reset_model_state()
         # Sample an initial MCS vector for _get_obs normalization
+        initial_arrivals = self._arrivals()
+        self.backlog += initial_arrivals
+        self.active_mask = (self.backlog > 0).astype(int)
         self._last_mcs = self._sample_mcs()
         return self._get_obs(), {}
 
     def step(self, action):
-        # 1) Channel sample
+        # 1) Channel sample for this TTI
         mcs = self._sample_mcs()
-        # 2) Arrivals
-        arrivals = self._arrivals()
-        self.backlog += arrivals
-        # 3) Project action -> PRBs
+
+        # 2) Use current backlog/active_mask (same state the agent observed)
         scores = np.clip(np.array(action, dtype=float), 0.0, 1.0)
-        prbs_out, prbs_pre, wasted_prbs = project_scores_to_prbs(scores, self.max_prb,
-                                                        self.backlog, mcs, self.active_mask,
-                                                        n_symb=self.n_symb, overhead=self.overhead,
-                                                        training_mode=self.training_mode)
-        # 4) Serve
+        prbs_out, prbs_pre, wasted_prbs = project_scores_to_prbs(
+            scores, self.max_prb, self.backlog, mcs, self.active_mask,
+            n_symb=self.n_symb, overhead=self.overhead, training_mode=self.training_mode
+        )
+
+        # 3) Serve according to prbs_out
         served = np.zeros(4, dtype=float)
         for i in range(4):
             tbs = tbs_38214_bytes(int(mcs[i]), int(prbs_out[i]), n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
             s = min(self.backlog[i], tbs)
             served[i] = s
             self.backlog[i] -= s
-        self.active_mask = ((self.backlog > 0).astype(int))
 
-        # 5) Fairness EMA (Mb/s)
+        # 4) Fairness EMA (Mb/s) based on served this TTI
         duration_s = self.tti_ms / 1000.0
         inst_mbps = (served * 8.0) / 1e6 / max(duration_s, 1e-9)
         self.thr_ema_mbps = self.rho * self.thr_ema_mbps + (1.0 - self.rho) * inst_mbps
 
-        # 6) Reward (no HOL): bounded O(1)
+        # 5) Reward (no HOL): bounded O(1)
         served_mb_tti = (served.sum() * 8.0) / 1e6
         throughput_norm = served_mb_tti / (self.max_mb_per_tti + 1e-12)  # ~[0,1]
         jain = jain_fairness(self.thr_ema_mbps)
         reward = self.alpha * throughput_norm + self.beta * jain
 
-        # 7) Finalize
+        # 6) Arrivals now produce next state s_{t+1}
+        arrivals = self._arrivals()
+        self.backlog += arrivals
+        self.active_mask = (self.backlog > 0).astype(int)
+
+        # 7) Finalize and info
         self.prev_prbs = prbs_out
         self.t += 1
         terminated = False
@@ -260,7 +266,7 @@ class MACSchedulerEnv(gym.Env):
             'arrivals': arrivals,
             'served_bytes': served,
             'prbs': prbs_out,
-            'backlog': self.backlog.copy(),
+            'backlog': self.backlog.copy(),  # post-arrivals (next state)
             'jain': jain,
             'thr_ema_mbps': self.thr_ema_mbps.copy(),
             'cell_tput_Mb': float(served_mb_tti),
@@ -268,7 +274,8 @@ class MACSchedulerEnv(gym.Env):
             'wasted_bytes': wasted_bytes
         }
 
-        return self._get_obs(), float(reward), terminated, truncated, info
+        next_obs = self._get_obs()
+        return next_obs, float(reward), terminated, truncated, info
 
     # ----------------------
     # Internals
