@@ -154,6 +154,9 @@ class MACSchedulerEnv(gym.Env):
         self.rng = np.random.default_rng(seed)
         self.training_mode = training_mode
 
+        self.global_step = 0
+        self.max_mcs = 28  # max MCS index (0..28)
+
         # Observation: per-UE [backlog_norm, mcs_norm, (prev_prbs_norm if enabled)] + [prb_budget_norm] + [active_mask(4)]
         # All features are in [0,1].
         self.load_clip_bytes = 2_000_000  # 2 MB clip for normalization to [0,1]
@@ -195,7 +198,7 @@ class MACSchedulerEnv(gym.Env):
             self.period_ms = np.zeros(4, dtype=int); self.period_bytes = np.zeros(4, dtype=int)
 
         self.lam_bytes_per_ms = arrival_bps / 8.0 / 1000.0
-
+        self.arrival_bps = (self.lam_bytes_per_ms * 8.0 * 1000.0).astype(float)
         # Throughput EMA init (tiny non-zero to avoid jain=1 cold-start)
         self.thr_ema_mbps = np.ones(4, dtype=float) * 1e-6
 
@@ -283,6 +286,27 @@ class MACSchedulerEnv(gym.Env):
             'wasted_prbs': int(wasted_prbs),
             'wasted_bytes': wasted_bytes
         }
+
+        # increment global step and apply periodic schedule every 10k steps
+        self.global_step += 1
+
+        if (self.global_step % 10000) == 0:
+            # bump mcs_mean (vector) by +5, wrap around 0..max_mcs
+            self.mcs_mean = ((np.array(self.mcs_mean, dtype=int) + 5) % (self.max_mcs + 1)).astype(int)
+
+            # bump arrival_bps by +10e6 and wrap modulo 50e6
+            self.arrival_bps = (np.array(self.arrival_bps, dtype=float) + 10e6) % 50e6
+
+            # recompute lam_bytes_per_ms used by _arrivals()
+            self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
+
+            # recompute any derived fields if needed (example: max_mb_per_tti)
+            max_bpp = bytes_per_prb(28, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
+            self.max_mb_per_tti = (self.max_prb * max_bpp * 8.0) / 1e6
+
+            # log (optional)
+            print(f"[SCHEDULE] global_step={self.global_step} mcs_mean={self.mcs_mean.tolist()} arrival_bps={self.arrival_bps.tolist()}")
+
 
         return next_obs, float(reward), terminated, truncated, info
 
