@@ -212,12 +212,12 @@ class MACSchedulerEnv(gym.Env):
         initial_arrivals = self._arrivals()
         self.backlog += initial_arrivals
         self.active_mask = (self.backlog > 0).astype(int)
-        self._last_mcs = self._sample_mcs()
+        self._curr_mcs = self._sample_mcs()
         return self._get_obs(), {}
 
     def step(self, action):
-        # 1) Channel sample for this TTI
-        mcs = self._sample_mcs()
+        # 1) Retrieve mcs for this TTI
+        mcs = self._curr_mcs.copy()
 
         # 2) Use current backlog/active_mask (same state the agent observed)
         scores = np.clip(np.array(action, dtype=float), 0.0, 1.0)
@@ -245,13 +245,23 @@ class MACSchedulerEnv(gym.Env):
         jain = jain_fairness(self.thr_ema_mbps)
         reward = self.alpha * throughput_norm + self.beta * jain
 
+        print(
+            f"[TTI {self.t:04d}] action=[{', '.join(f'{x:.3f}' for x in np.asarray(action, dtype=float))}] "
+            f"prbs_out={prbs_out.tolist()} served={served.tolist()} "
+            f"served_mb_tti={served_mb_tti:.3f} max_mb_per_tti={self.max_mb_per_tti:.3f} "
+            f"active_mask={self.active_mask.tolist()}"
+        )
+
         # 6) Arrivals now produce next state s_{t+1}
         arrivals = self._arrivals()
         self.backlog += arrivals
         self.active_mask = (self.backlog > 0).astype(int)
-
-        # 7) Finalize and info
         self.prev_prbs = prbs_out
+        self._curr_mcs = self._sample_mcs()
+
+        next_obs = self._get_obs()
+    
+        # 7) Finalize and info
         self.t += 1
         terminated = False
         truncated = self.t >= self.duration_tti
@@ -274,18 +284,21 @@ class MACSchedulerEnv(gym.Env):
             'wasted_bytes': wasted_bytes
         }
 
-        next_obs = self._get_obs()
         return next_obs, float(reward), terminated, truncated, info
 
     # ----------------------
     # Internals
     # ----------------------
     def _get_obs(self):
+        backlog = self.backlog.astype(float)  # bytes
+        eps = 1e-9
+        total = float(backlog.sum())
+        share = (backlog / (total + eps)).clip(0.0, 1.0)   # shape (4,)
         obs = []
         # per-UE features
         for i in range(4):
-            load_norm = float(np.clip(self.backlog[i] / self.load_clip_bytes, 0.0, 1.0))
-            mcs_norm = float(np.clip(getattr(self, '_last_mcs', np.zeros(4))[i] / 28.0, 0.0, 1.0))
+            load_norm = share[i]
+            mcs_norm = float(np.clip(getattr(self, '_curr_mcs', np.zeros(4))[i] / 28.0, 0.0, 1.0))
             obs.extend([load_norm, mcs_norm])
             if self.use_prev_prbs:
                 obs.append(float(self.prev_prbs[i]) / max(1, self.max_prb))
@@ -301,8 +314,8 @@ class MACSchedulerEnv(gym.Env):
         else:
             jitter = self.rng.integers(-self.mcs_spread, self.mcs_spread + 1, size=4)
             mcs = np.clip(self.mcs_mean + jitter, 0, 28)
-        self._last_mcs = mcs.astype(int)
-        return self._last_mcs
+        self._curr_mcs = mcs.astype(int)
+        return self._curr_mcs
 
     def _arrivals(self):
         # Poisson arrivals (bytes/ms) + optional periodic bursts
@@ -310,7 +323,4 @@ class MACSchedulerEnv(gym.Env):
         for i in range(4):
             if self.period_ms[i] > 0 and (self.t % self.period_ms[i] == 0):
                 arr[i] += self.period_bytes[i]
-        # Active if backlog will be >0 this TTI (after adding arrivals)
-        # future_backlog = self.backlog + arr
-        # self.active_mask = ((future_backlog > 0).astype(int))
         return arr
