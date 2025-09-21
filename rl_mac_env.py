@@ -64,7 +64,10 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
     fracs = scores / total if total > 0 else np.zeros_like(scores)
     raw = fracs * prb_budget
     prbs_pre = np.floor(raw).astype(int)
-
+    
+    # print(
+    #   f"scores={scores} prbs_pre={prbs_pre}"
+    # )
     # ensure sum(prbs_pre) == prb_budget by distributing leftover (same as before)
     leftover = prb_budget - prbs_pre.sum()
     if leftover > 0:
@@ -75,6 +78,7 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
             prbs_pre[k] += 1
             leftover -= 1
 
+    # print(f"prbs_pre={prbs_pre}")
     # robust caps (backlog-based): as before
     bpp_raw = np.array([bytes_per_prb(int(m), n_symb, overhead) for m in ue_mcs_idx], dtype=float)
     bpp = np.maximum(bpp_raw, 4.0)
@@ -84,10 +88,12 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
     # clip pre-alloc to caps (a UE cannot use more PRBs than its backlog allows)
     prbs_pre = np.minimum(prbs_pre, caps)
 
+    # print(f"prbs_pre={prbs_pre} active_mask={active_mask}")
     if training_mode:
         # train-mode: do NOT redistribute PRBs intended for inactive UEs
         prbs_out = prbs_pre * active_mask.astype(int)   # lost prbs vanish
         wasted_prbs = int((prbs_pre * (1 - active_mask)).sum())
+        # print(f"prbs_out={prbs_out} ")
     else:
         # deployment: mask scores early / redistribute as before (safe behavior)
         # Here we mimic previous behavior: zero scores, compute allocation with caps+active_mask and redistribution
@@ -161,7 +167,8 @@ class MACSchedulerEnv(gym.Env):
         # All features are in [0,1].
         self.load_clip_bytes = 2_000_000  # 2 MB clip for normalization to [0,1]
         per_ue_dim = 2 + (1 if use_prev_prbs else 0)
-        self.obs_dim = per_ue_dim * 4 + 1 + 4
+        # self.obs_dim = per_ue_dim * 4 + 1 + 4
+        self.obs_dim = 2*4
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.obs_dim,), dtype=np.float32)
         # Action: non-negative allocation scores per UE in [0,1]; relative proportions matter
         self.action_space = spaces.Box(low=0.0, high=1.0, shape=(4,), dtype=np.float32)
@@ -182,7 +189,7 @@ class MACSchedulerEnv(gym.Env):
         if self.fading_profile == 'fast':
             self.mcs_mean = np.array([14,18,10,22]); self.mcs_spread = 4
         elif self.fading_profile == 'slow':
-            self.mcs_mean = np.array([12,16,9,20]); self.mcs_spread = 2
+            self.mcs_mean = np.array([2,16,7,27]); self.mcs_spread = 2
         else:
             self.mcs_mean = np.array([12,18,10,22]); self.mcs_spread = 0
 
@@ -210,7 +217,10 @@ class MACSchedulerEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self.t = 0
-        self.reset_model_state()
+        self.backlog = np.zeros(4, dtype=float)
+        self.prev_prbs = np.zeros(4, dtype=int)
+        self.active_mask = np.zeros(4, dtype=int)  # start inactive
+        # self.reset_model_state()
         # Sample an initial MCS vector for _get_obs normalization
         initial_arrivals = self._arrivals()
         self.backlog += initial_arrivals
@@ -248,12 +258,13 @@ class MACSchedulerEnv(gym.Env):
         jain = jain_fairness(self.thr_ema_mbps)
         reward = self.alpha * throughput_norm + self.beta * jain
 
-        print(
-            f"[TTI {self.t:04d}] action=[{', '.join(f'{x:.3f}' for x in np.asarray(action, dtype=float))}] "
-            f"prbs_out={prbs_out.tolist()} served={served.tolist()} "
-            f"served_mb_tti={served_mb_tti:.3f} max_mb_per_tti={self.max_mb_per_tti:.3f} "
-            f"active_mask={self.active_mask.tolist()}"
-        )
+        # print(
+        #     f"[TTI {self.t:04d}] action=[{', '.join(f'{x:.3f}' for x in np.asarray(action, dtype=float))}] "
+        #     f"mcs={mcs} "
+        #     f"prbs_out={prbs_out.tolist()} served={served.tolist()} "
+        #     f"served_mb_tti={served_mb_tti:.3f} max_mb_per_tti={self.max_mb_per_tti:.3f} "
+        #     f"active_mask={self.active_mask.tolist()}"
+        # ) 
 
         # 6) Arrivals now produce next state s_{t+1}
         arrivals = self._arrivals()
@@ -263,7 +274,8 @@ class MACSchedulerEnv(gym.Env):
         self._curr_mcs = self._sample_mcs()
 
         next_obs = self._get_obs()
-    
+
+        # print(f"arrivals={arrivals}")
         # 7) Finalize and info
         self.t += 1
         terminated = False
@@ -294,19 +306,18 @@ class MACSchedulerEnv(gym.Env):
             # bump mcs_mean (vector) by +5, wrap around 0..max_mcs
             self.mcs_mean = ((np.array(self.mcs_mean, dtype=int) + 5) % (self.max_mcs + 1)).astype(int)
 
-            # bump arrival_bps by +10e6 and wrap modulo 50e6
-            self.arrival_bps = (np.array(self.arrival_bps, dtype=float) + 10e6) % 50e6
+            # # bump arrival_bps by +10e6 and wrap modulo 50e6
+            # self.arrival_bps = (np.array(self.arrival_bps, dtype=float) + 10e6) % 50e6
 
-            # recompute lam_bytes_per_ms used by _arrivals()
-            self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
+            # # recompute lam_bytes_per_ms used by _arrivals()
+            # self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
 
-            # recompute any derived fields if needed (example: max_mb_per_tti)
-            max_bpp = bytes_per_prb(28, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
-            self.max_mb_per_tti = (self.max_prb * max_bpp * 8.0) / 1e6
+            # # recompute any derived fields if needed (example: max_mb_per_tti)
+            # max_bpp = bytes_per_prb(28, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
+            # self.max_mb_per_tti = (self.max_prb * max_bpp * 8.0) / 1e6
 
             # log (optional)
             print(f"[SCHEDULE] global_step={self.global_step} mcs_mean={self.mcs_mean.tolist()} arrival_bps={self.arrival_bps.tolist()}")
-
 
         return next_obs, float(reward), terminated, truncated, info
 
@@ -324,12 +335,12 @@ class MACSchedulerEnv(gym.Env):
             load_norm = share[i]
             mcs_norm = float(np.clip(getattr(self, '_curr_mcs', np.zeros(4))[i] / 28.0, 0.0, 1.0))
             obs.extend([load_norm, mcs_norm])
-            if self.use_prev_prbs:
-                obs.append(float(self.prev_prbs[i]) / max(1, self.max_prb))
+            # if self.use_prev_prbs:
+            #     obs.append(float(self.prev_prbs[i]) / max(1, self.max_prb))
         # global prb budget (normalized to 273)
-        obs.append(float(self.max_prb) / 273.0)
+        # obs.append(float(self.max_prb) / 273.0)
         # active mask
-        obs.extend(self.active_mask.astype(float).tolist())
+        # obs.extend(self.active_mask.astype(float).tolist())
         return np.array(obs, dtype=np.float32)
 
     def _sample_mcs(self):
