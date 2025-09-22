@@ -143,7 +143,12 @@ class MACSchedulerEnv(gym.Env):
                  traffic_profile: str = 'mixed',
                  fading_profile: str = 'fast',
                  seed: int = 42,
-                 training_mode=True):
+                 training_mode=True,
+                 reward_mode: str = "throughput_jain",   # "throughput_jain" | "pf_gain" | "pf_ratio"
+                 pf_clip: float = 1.0,                   # clip for delta-PF reward after normalization
+                 pf_ratio_clip: float = 10.0,            # clamp r_i / Rbar_i to avoid spikes
+                 pf_eps: float = 1e-6                    # numerical floor for logs/ratios
+                 ):
         
         super().__init__()
         self.use_prev_prbs = use_prev_prbs
@@ -159,6 +164,11 @@ class MACSchedulerEnv(gym.Env):
         self.fading_profile = fading_profile
         self.rng = np.random.default_rng(seed)
         self.training_mode = training_mode
+        self.reward_mode = reward_mode
+        self.pf_clip = float(pf_clip)
+        self.pf_ratio_clip = float(pf_ratio_clip)
+        self.pf_eps = float(pf_eps)
+
 
         self.global_step = 0
         self.max_mcs = 28  # max MCS index (0..28)
@@ -240,24 +250,58 @@ class MACSchedulerEnv(gym.Env):
         )
 
         # 3) Serve according to prbs_out
-        served = np.zeros(4, dtype=float)
+        served = np.zeros(4, dtype=float) # [Served bytes in a TTI]
         for i in range(4):
             tbs = tbs_38214_bytes(int(mcs[i]), int(prbs_out[i]), n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
             s = min(self.backlog[i], tbs)
             served[i] = s
             self.backlog[i] -= s
+     
+        # 4 & 5) Calculate reward
+        served_mb_tti = (served.sum() * 8.0) / 1e6 # Total served load in this TTI[Megabits per TTI]
+        throughput_norm = served_mb_tti / (self.max_mb_per_tti + 1e-12)  # ~[0,1] # Normalized served load in this TTI [Megabits per TTI]
 
-        # 4) Fairness EMA (Mb/s) based on served this TTI
         duration_s = self.tti_ms / 1000.0
-        inst_mbps = (served * 8.0) / 1e6 / max(duration_s, 1e-9)
-        self.thr_ema_mbps = self.rho * self.thr_ema_mbps + (1.0 - self.rho) * inst_mbps
+        thr_inst_mbps = (served * 8.0) / 1e6 / max(duration_s, 1e-9) # Instantaneous rate per UE [Megabits per second]
+        
+        Rbar_old = self.thr_ema_mbps.copy()
+        Rbar_new = self.rho * Rbar_old + (1.0 - self.rho) * thr_inst_mbps # Long-term rate [Megabits per second]
+        
+        jain = jain_fairness(Rbar_new) # Fairness metric calculation
+        
+        reward = None
 
-        # 5) Reward (no HOL): bounded O(1)
-        served_mb_tti = (served.sum() * 8.0) / 1e6
-        throughput_norm = served_mb_tti / (self.max_mb_per_tti + 1e-12)  # ~[0,1]
-        jain = jain_fairness(self.thr_ema_mbps)
-        reward = self.alpha * throughput_norm + self.beta * jain
+        if self.reward_mode == "throughput_jain":
+            # Your existing reward (leave as-is)
+            reward = self.alpha * throughput_norm + self.beta * jain
 
+        elif self.reward_mode == "pf_gain":
+            # ----- Reward = normalized ΔPF utility (safer, goal-aligned) -----
+            # EMA update: Rbar_new = rho * Rbar_old + (1 - rho) * r
+            rho = self.rho
+            U_old = np.sum(np.log(np.maximum(Rbar_old, self.pf_eps)))
+            U_new = np.sum(np.log(np.maximum(Rbar_new, self.pf_eps)))
+            dU = U_new - U_old
+
+            # Normalize by (1 - rho) and number of UEs → roughly scale-free, ∈ ~[0,1]-ish
+            denom = max((1.0 - rho) * len(Rbar_old), self.pf_eps)
+            reward = np.clip(dU / denom, -self.pf_clip, self.pf_clip)
+
+        elif self.reward_mode == "pf_ratio":
+            # ----- Reward = sum_i clamp(r_i / Rbar_i) (bounded & simple) -----
+            Rbar = np.maximum(Rbar_old, self.pf_eps)
+            ratio = thr_inst_mbps / Rbar
+
+            # Clamp extreme ratios to keep critic sane (cold-starts, bursts)
+            ratio = np.clip(ratio, 0.0, self.pf_ratio_clip)
+
+            # Normalize by UE count and clip to [0,1]
+            reward = np.clip(np.sum(ratio) / (len(ratio) * self.pf_ratio_clip), 0.0, 1.0)
+
+        else:
+            raise ValueError(f"Unknown reward_mode: {self.reward_mode}")        
+        
+        self.thr_ema_mbps = Rbar_new
         # print(
         #     f"[TTI {self.t:04d}] action=[{', '.join(f'{x:.3f}' for x in np.asarray(action, dtype=float))}] "
         #     f"mcs={mcs} "

@@ -8,7 +8,7 @@ from stable_baselines3.common.monitor import Monitor
 
 from rl_mac_env import MACSchedulerEnv
 
-def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, rho, save_dir, training_mode):
+def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, rho, save_dir, training_mode, reward_mode, pf_clip, pf_ratio_clip, pf_eps):
     def _thunk():
         env = MACSchedulerEnv(
             use_prev_prbs=use_prev_prbs,
@@ -21,7 +21,11 @@ def make_env(use_prev_prbs, profile, fading, seed, alpha, beta, rho, save_dir, t
             gamma_latency=0.0,   # ignored in env (no HOL)
             fairness_ema_rho=rho,
             seed=seed,
-            training_mode=training_mode
+            training_mode=training_mode,
+            reward_mode=reward_mode,
+            pf_clip=pf_clip,
+            pf_ratio_clip=pf_ratio_clip,
+            pf_eps=pf_eps
         )
         monitor_path = os.path.join(save_dir, "monitor.csv")
         # Drop mean_hol_ms (removed from env); keep jain & throughput per TTI
@@ -46,15 +50,31 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     # training_mode: 1=train behavior (no redistribution to inactive UEs), 0=deploy behavior
     p.add_argument("--training_mode", type=int, default=1)
+    p.add_argument("--reward_mode", type=str, default="throughput_jain", choices=["throughput_jain", "pf_gain", "pf_ratio"])
+    p.add_argument("--pf_clip", type=float, default=1.0)
+    p.add_argument("--pf_ratio_clip", type=float, default=10.0)
+    p.add_argument("--pf_eps", type=float, default=1e-6)
     args = p.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
     logger = configure(args.save_dir, ["stdout","csv","tensorboard"])
 
     # No VecNormalize: observations are already normalized in-env; reward is O(1)
-    env = DummyVecEnv([make_env(bool(args.use_prev_prbs), args.profile, args.fading,
-                                args.seed, args.alpha, args.beta, args.rho, args.save_dir,
-                                bool(args.training_mode))])
+    env = DummyVecEnv([make_env(
+        bool(args.use_prev_prbs),
+        args.profile,
+        args.fading,
+        args.seed,
+        args.alpha,
+        args.beta,
+        args.rho,
+        args.save_dir,
+        bool(args.training_mode),
+        args.reward_mode,
+        args.pf_clip,
+        args.pf_ratio_clip,
+        args.pf_eps
+    )])
     env = VecMonitor(env)
 
     policy_kwargs = dict(net_arch=[128,128])
