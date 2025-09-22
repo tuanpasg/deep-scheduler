@@ -230,6 +230,7 @@ class MACSchedulerEnv(gym.Env):
         self.backlog = np.zeros(4, dtype=float)
         self.prev_prbs = np.zeros(4, dtype=int)
         self.active_mask = np.zeros(4, dtype=int)  # start inactive
+        self.thr_ema_mbps = np.ones(4, dtype=float) * 1e-6
         # self.reset_model_state()
         # Sample an initial MCS vector for _get_obs normalization
         initial_arrivals = self._arrivals()
@@ -258,7 +259,7 @@ class MACSchedulerEnv(gym.Env):
             self.backlog[i] -= s
      
         # 4 & 5) Calculate reward
-        served_mb_tti = (served.sum() * 8.0) / 1e6 # Total served load in this TTI[Megabits per TTI]
+        served_mb_tti = (served.sum() * 8.0) / 1e6 # Total served load in this TTI [Megabits per TTI]
         throughput_norm = served_mb_tti / (self.max_mb_per_tti + 1e-12)  # ~[0,1] # Normalized served load in this TTI [Megabits per TTI]
 
         duration_s = self.tti_ms / 1000.0
@@ -350,15 +351,17 @@ class MACSchedulerEnv(gym.Env):
             # bump mcs_mean (vector) by +5, wrap around 0..max_mcs
             self.mcs_mean = ((np.array(self.mcs_mean, dtype=int) + 5) % (self.max_mcs + 1)).astype(int)
 
-            # # bump arrival_bps by +10e6 and wrap modulo 50e6
-            # self.arrival_bps = (np.array(self.arrival_bps, dtype=float) + 10e6) % 50e6
+            # bump arrival_bps by +10e6 and wrap modulo 50e6
+            updated_arrivals = (np.array(self.arrival_bps, dtype=float) + 10e6) % 50e6
+            updated_arrivals[np.isclose(updated_arrivals, 0.0)] = 5e6
+            self.arrival_bps = updated_arrivals
 
-            # # recompute lam_bytes_per_ms used by _arrivals()
-            # self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
+            # recompute lam_bytes_per_ms used by _arrivals()
+            self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
 
-            # # recompute any derived fields if needed (example: max_mb_per_tti)
-            # max_bpp = bytes_per_prb(28, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
-            # self.max_mb_per_tti = (self.max_prb * max_bpp * 8.0) / 1e6
+            # recompute any derived fields if needed (example: max_mb_per_tti)
+            max_bpp = bytes_per_prb(28, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
+            self.max_mb_per_tti = (self.max_prb * max_bpp * 8.0) / 1e6
 
             # log (optional)
             print(f"[SCHEDULE] global_step={self.global_step} mcs_mean={self.mcs_mean.tolist()} arrival_bps={self.arrival_bps.tolist()}")
