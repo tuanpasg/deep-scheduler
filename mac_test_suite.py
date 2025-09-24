@@ -76,6 +76,12 @@ def compute_metrics(logs: List[Dict], tti_ms: float = 1.0) -> Dict[str, float]:
     hol_flat = hol.flatten().astype(float)
     mean_hol = float(np.mean(hol_flat))
     p95_hol  = float(np.percentile(hol_flat, 95))
+
+    # Scheduler decision runtime (seconds -> microseconds)
+    decision_runtimes = np.array([float(log.get("decision_runtime_s", np.nan)) for log in logs], dtype=float)
+    valid_runtime = np.isfinite(decision_runtimes)
+    avg_runtime_us = float(decision_runtimes[valid_runtime].mean() * 1e6) if valid_runtime.any() else 0.0
+
     
     return {
         "cell_throughput_Mbps": float(cell_tput_mbps),
@@ -83,6 +89,7 @@ def compute_metrics(logs: List[Dict], tti_ms: float = 1.0) -> Dict[str, float]:
         "prb_utilization": float(prb_util),
         "mean_latency_ms": mean_hol,
         "p95_latency_ms": p95_hol,
+        "avg_decision_runtime_us": avg_runtime_us,
         "per_ue_throughput_Mbps": per_ue_mbps.tolist(),
     }
 
@@ -414,7 +421,9 @@ class Simulator:
             ]
         }
         
+        start_time = time.perf_counter()
         prbs = scheduler.decide(state)
+        decision_runtime_s = time.perf_counter() - start_time
         prbs = _sanitize(np.asarray(prbs, dtype=int), prb_budget)
         
         bpp = np.array([bytes_per_prb(int(m)) for m in mcs])  # bytes per PRB
@@ -435,6 +444,7 @@ class Simulator:
             "served_bytes": served.tolist(),
             "backlog_bytes": [u.backlog_bytes for u in self.ues],
             "hol_ms": [u.hol_ms for u in self.ues],
+            "decision_runtime_s": float(decision_runtime_s),
         }
         
         self.channel.step()
@@ -520,7 +530,8 @@ def main():
             metrics = compute_metrics(logs, tti_ms=cfg.tti_ms)
             print(f"[{sc_name} | {sch.name()}] cell_tput={metrics['cell_throughput_Mbps']:.2f} Mbps, "
                   f"Jain={metrics['jain_fairness']:.3f}, util={metrics['prb_utilization']:.3f}, "
-                  f"mean_lat={metrics['mean_latency_ms']:.2f} ms, p95={metrics['p95_latency_ms']:.2f} ms")
+                  f"mean_lat={metrics['mean_latency_ms']:.2f} ms, p95={metrics['p95_latency_ms']:.2f} ms, "
+                  f"runtime={metrics['avg_decision_runtime_us']:.1f} us")
             rows.append({
                 "scenario": sc_name,
                 "scheduler": sch.name(),

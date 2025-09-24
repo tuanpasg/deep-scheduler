@@ -58,7 +58,7 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
     scores = np.array(scores, dtype=np.float64)
     prb_budget = int(prb_budget)
     if prb_budget <= 0 or np.all(scores <= 0):
-        return np.zeros(4, dtype=int), np.zeros(4, dtype=int), 0
+        return np.zeros(4, dtype=int), np.zeros(4, dtype=int), 0, 0
 
     total = scores.sum()
     fracs = scores / total if total > 0 else np.zeros_like(scores)
@@ -96,9 +96,6 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
         # train-mode: do NOT redistribute PRBs intended for inactive UEs
         # Start from prbs_pre but mask invalid UEs (they get 0 actual PRBs)
         prbs_out = (prbs_pre * active_mask.astype(int)).astype(int)
-
-        # Count PRBs agent intended to give to invalid UEs (for logging / penalty)
-        invalid_allocated_prbs = int((prbs_pre * (1 - active_mask)).sum())
 
         # How many PRBs are already assigned to valid UEs
         allocated_valid = int(prbs_out.sum())
@@ -158,17 +155,18 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
 
         wasted_prbs = int((prbs_pre * (1 - active_mask)).sum())  # for bookkeeping
 
-    # unassigned PRBs (system-level)
-    unassigned_prbs = int(prb_budget - int(np.sum(prbs_out)))
+    # # unassigned PRBs (system-level)
+    # unassigned_prbs = int(prb_budget - int(np.sum(prbs_out)))
 
-    # new definition of wasted_prbs (per your request):
-    # - only count unassigned_prbs as 'wasted_prbs' IF there exist zero-score UEs
-    #   that have non-empty backlog (i.e., agent gave score==0 but backlog>0).
-    zero_score_nonempty = np.logical_and(scores == 0.0, ue_load_bytes > 0.0)
-    if np.any(zero_score_nonempty):
-        wasted_prbs = unassigned_prbs
-    else:
-        wasted_prbs = 0
+    # # new definition of wasted_prbs (per your request):
+    # # - only count unassigned_prbs as 'wasted_prbs' IF there exist zero-score UEs
+    # #   that have non-empty backlog (i.e., agent gave score==0 but backlog>0).
+    # zero_score_nonempty = np.logical_and(scores == 0.0, ue_load_bytes > 0.0)
+    # if np.any(zero_score_nonempty):
+    #     wasted_prbs = unassigned_prbs
+    # else:
+    #     wasted_prbs = 0
+    wasted_prbs = prbs_pre - invalid_allocated_prbs - int(prbs_out.sum())
 
     return prbs_out.astype(int), prbs_pre.astype(int), int(wasted_prbs), int(invalid_allocated_prbs)
 
@@ -295,7 +293,7 @@ class MACSchedulerEnv(gym.Env):
 
         # 2) Use current backlog/active_mask (same state the agent observed)
         scores = np.clip(np.array(action, dtype=float), 0.0, 1.0)
-        prbs_out, prbs_pre, invalid_allocated_prbs, wasted_prbs = project_scores_to_prbs(
+        prbs_out, prbs_pre, wasted_prbs, invalid_allocated_prbs = project_scores_to_prbs(
             scores, self.max_prb, self.backlog, mcs, self.active_mask,
             n_symb=self.n_symb, overhead=self.overhead, training_mode=self.training_mode
         )
