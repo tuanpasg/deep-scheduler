@@ -166,7 +166,7 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
     #     wasted_prbs = unassigned_prbs
     # else:
     #     wasted_prbs = 0
-    wasted_prbs = prbs_pre - invalid_allocated_prbs - int(prbs_out.sum())
+    wasted_prbs = prb_budget - invalid_allocated_prbs - int(prbs_out.sum())
 
     return prbs_out.astype(int), prbs_pre.astype(int), int(wasted_prbs), int(invalid_allocated_prbs)
 
@@ -280,7 +280,30 @@ class MACSchedulerEnv(gym.Env):
         self.active_mask = np.zeros(4, dtype=int)  # start inactive
         self.thr_ema_mbps = np.ones(4, dtype=float) * 1e-6
         # self.reset_model_state()
-        # Sample an initial MCS vector for _get_obs normalization
+        
+        self.global_step += 1
+        if self.global_step == 5:
+            # bump mcs_mean (vector) by +5, wrap around 0..max_mcs
+            self.mcs_mean = ((np.array(self.mcs_mean, dtype=int) + 2) % (self.max_mcs + 1)).astype(int)
+
+            # bump arrival_bps by +10e6 and wrap modulo 50e6
+            updated_arrivals = (np.array(self.arrival_bps, dtype=float) + 5e6) % 50e6
+            updated_arrivals[np.isclose(updated_arrivals, 0.0)] = 5e6
+            self.arrival_bps = updated_arrivals
+
+            # recompute lam_bytes_per_ms used by _arrivals()
+            self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
+
+            # recompute any derived fields if needed (example: max_mb_per_tti)
+            max_bpp = bytes_per_prb(28, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
+            self.max_mb_per_tti = (self.max_prb * max_bpp * 8.0) / 1e6
+
+            # log (optional)
+            print(f"[SCHEDULE] global_step={self.global_step} mcs_mean={self.mcs_mean.tolist()} arrival_bps={self.arrival_bps.tolist()}")
+
+            self.global_step = 0
+        # Reset initial state
+        
         initial_arrivals = self._arrivals()
         self.backlog += initial_arrivals
         self.active_mask = (self.backlog > 0).astype(int)
@@ -392,28 +415,6 @@ class MACSchedulerEnv(gym.Env):
             'invalid_allocated_prbs':int(invalid_allocated_prbs)
             # 'wasted_bytes': wasted_bytes
         }
-
-        # increment global step and apply periodic schedule every 10k steps
-        self.global_step += 1
-
-        if (self.global_step % 10000) == 0:
-            # bump mcs_mean (vector) by +5, wrap around 0..max_mcs
-            self.mcs_mean = ((np.array(self.mcs_mean, dtype=int) + 5) % (self.max_mcs + 1)).astype(int)
-
-            # bump arrival_bps by +10e6 and wrap modulo 50e6
-            updated_arrivals = (np.array(self.arrival_bps, dtype=float) + 5e6) % 50e6
-            updated_arrivals[np.isclose(updated_arrivals, 0.0)] = 5e6
-            self.arrival_bps = updated_arrivals
-
-            # recompute lam_bytes_per_ms used by _arrivals()
-            self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
-
-            # recompute any derived fields if needed (example: max_mb_per_tti)
-            max_bpp = bytes_per_prb(28, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
-            self.max_mb_per_tti = (self.max_prb * max_bpp * 8.0) / 1e6
-
-            # log (optional)
-            print(f"[SCHEDULE] global_step={self.global_step} mcs_mean={self.mcs_mean.tolist()} arrival_bps={self.arrival_bps.tolist()}")
 
         return next_obs, float(reward), terminated, truncated, info
 
