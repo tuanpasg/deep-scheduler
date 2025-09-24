@@ -88,12 +88,50 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
     # clip pre-alloc to caps (a UE cannot use more PRBs than its backlog allows)
     prbs_pre = np.minimum(prbs_pre, caps)
 
+    # Metric: PRBs agent assigned to invalid UEs (before masking)
+    invalid_allocated_prbs = int((prbs_pre * (1 - active_mask)).sum())
+
     # print(f"prbs_pre={prbs_pre} active_mask={active_mask}")
     if training_mode:
         # train-mode: do NOT redistribute PRBs intended for inactive UEs
-        prbs_out = prbs_pre * active_mask.astype(int)   # lost prbs vanish
-        wasted_prbs = int((prbs_pre * (1 - active_mask)).sum())
-        # print(f"prbs_out={prbs_out} ")
+        # Start from prbs_pre but mask invalid UEs (they get 0 actual PRBs)
+        prbs_out = (prbs_pre * active_mask.astype(int)).astype(int)
+
+        # Count PRBs agent intended to give to invalid UEs (for logging / penalty)
+        invalid_allocated_prbs = int((prbs_pre * (1 - active_mask)).sum())
+
+        # How many PRBs are already assigned to valid UEs
+        allocated_valid = int(prbs_out.sum())
+
+        # Remaining PRBs available for redistribution (per your definition)
+        remaining_prbs = prb_budget - allocated_valid - invalid_allocated_prbs
+        # remaining_prbs may be >0 when prbs_pre sum < prb_budget (due to caps) OR when agent
+        # assigned PRBs to invalid UEs (those vanish from prbs_out but we count them as 'removed').
+
+        if remaining_prbs > 0:
+            # compute how many PRBs each valid UE still needs (caps minus current assigned)
+            remaining_caps = np.maximum(caps - prbs_out, 0).astype(int)
+
+            # build candidate list: valid UEs that still need PRBs (backlog > 0 after current allocation)
+            candidates = np.where((active_mask == 1) & (remaining_caps > 0))[0]
+
+            if candidates.size > 0:
+                # order candidates by agent score (high -> low)
+                # if scores contains ties, np.argsort keeps deterministic order
+                order = candidates[np.argsort(-scores[candidates])]
+
+                # allocate greedily in that order until we run out or all needs satisfied
+                for ue in order:
+                    if remaining_prbs <= 0:
+                        break
+                    need = int(remaining_caps[ue])
+                    if need <= 0:
+                        continue
+                    give = min(need, remaining_prbs)
+                    prbs_out[ue] += give
+                    remaining_prbs -= give
+                    remaining_caps[ue] -= give
+                    # stop early if no more remaining_prbs
     else:
         # deployment: mask scores early / redistribute as before (safe behavior)
         # Here we mimic previous behavior: zero scores, compute allocation with caps+active_mask and redistribution
@@ -120,7 +158,19 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
 
         wasted_prbs = int((prbs_pre * (1 - active_mask)).sum())  # for bookkeeping
 
-    return prbs_out.astype(int), prbs_pre.astype(int), wasted_prbs
+    # unassigned PRBs (system-level)
+    unassigned_prbs = int(prb_budget - int(np.sum(prbs_out)))
+
+    # new definition of wasted_prbs (per your request):
+    # - only count unassigned_prbs as 'wasted_prbs' IF there exist zero-score UEs
+    #   that have non-empty backlog (i.e., agent gave score==0 but backlog>0).
+    zero_score_nonempty = np.logical_and(scores == 0.0, ue_load_bytes > 0.0)
+    if np.any(zero_score_nonempty):
+        wasted_prbs = unassigned_prbs
+    else:
+        wasted_prbs = 0
+
+    return prbs_out.astype(int), prbs_pre.astype(int), int(wasted_prbs), int(invalid_allocated_prbs)
 
 # ----------------------
 # Environment
@@ -245,7 +295,7 @@ class MACSchedulerEnv(gym.Env):
 
         # 2) Use current backlog/active_mask (same state the agent observed)
         scores = np.clip(np.array(action, dtype=float), 0.0, 1.0)
-        prbs_out, prbs_pre, wasted_prbs = project_scores_to_prbs(
+        prbs_out, prbs_pre, invalid_allocated_prbs, wasted_prbs = project_scores_to_prbs(
             scores, self.max_prb, self.backlog, mcs, self.active_mask,
             n_symb=self.n_symb, overhead=self.overhead, training_mode=self.training_mode
         )
@@ -326,10 +376,10 @@ class MACSchedulerEnv(gym.Env):
         terminated = False
         truncated = self.t >= self.duration_tti
 
-        bpp_raw = np.array([bytes_per_prb(int(m), self.n_symb, self.overhead) for m in mcs], dtype=float)
-        bpp = np.maximum(bpp_raw, 4.0)
-        wasted_prbs_array = (prbs_pre - prbs_out).clip(min=0)
-        wasted_bytes = float((wasted_prbs_array * bpp).sum())
+        # bpp_raw = np.array([bytes_per_prb(int(m), self.n_symb, self.overhead) for m in mcs], dtype=float)
+        # bpp = np.maximum(bpp_raw, 4.0)
+        # wasted_prbs_array = (prbs_pre - prbs_out).clip(min=0)
+        # wasted_bytes = float((wasted_prbs_array * bpp).sum())
 
         info = {
             'mcs': mcs,
@@ -341,7 +391,8 @@ class MACSchedulerEnv(gym.Env):
             'thr_ema_mbps': self.thr_ema_mbps.copy(),
             'cell_tput_Mb': float(served_mb_tti),
             'wasted_prbs': int(wasted_prbs),
-            'wasted_bytes': wasted_bytes
+            'invalid_allocated_prbs':int(invalid_allocated_prbs)
+            # 'wasted_bytes': wasted_bytes
         }
 
         # increment global step and apply periodic schedule every 10k steps
@@ -352,7 +403,7 @@ class MACSchedulerEnv(gym.Env):
             self.mcs_mean = ((np.array(self.mcs_mean, dtype=int) + 5) % (self.max_mcs + 1)).astype(int)
 
             # bump arrival_bps by +10e6 and wrap modulo 50e6
-            updated_arrivals = (np.array(self.arrival_bps, dtype=float) + 10e6) % 50e6
+            updated_arrivals = (np.array(self.arrival_bps, dtype=float) + 5e6) % 50e6
             updated_arrivals[np.isclose(updated_arrivals, 0.0)] = 5e6
             self.arrival_bps = updated_arrivals
 
@@ -398,6 +449,53 @@ class MACSchedulerEnv(gym.Env):
             mcs = np.clip(self.mcs_mean + jitter, 0, 28)
         self._curr_mcs = mcs.astype(int)
         return self._curr_mcs
+
+    def compute_backlog_and_cap_features(self, mcs):
+        # mcs: array-like of per-UE MCS indices (integers)
+        # backlog: self.backlog (bytes per UE)
+        # prev_prbs: self.prev_prbs (int PRBs assigned previously) or zeros if not used
+        # self.max_prb exists
+
+        # bytes per PRB per UE (you already use bytes_per_prb)
+        bpp_raw = np.array([bytes_per_prb(int(m), n_symb=self.n_symb, overhead=self.overhead)
+                            for m in mcs], dtype=float)
+        # numerical floor
+        bpp = np.maximum(bpp_raw, 4.0)   # bytes per PRB
+
+        # capacity (bytes) if whole TTI used at best MCS
+        max_bpp = np.max(bpp)  # or a precomputed constant for best MCS
+        capacity_per_tti_bytes = float(self.max_prb * max_bpp) + 1e-12
+
+        # PRB caps computed from backlog & per-UE bpp (as your code)
+        caps = np.minimum(np.ceil(np.divide(self.backlog, bpp)).astype(int), self.max_prb)
+        caps = np.maximum(0, caps)   # ensure non-negative
+
+        # 1) backlog_norm: fraction of whole-cell TTI capacity (0..1)
+        backlog_norm = np.clip(self.backlog / capacity_per_tti_bytes, 0.0, 1.0)
+
+        # optionally log-scale:
+        backlog_norm_log = np.log1p(self.backlog) / np.log1p(capacity_per_tti_bytes)
+
+        # 2) cap_remaining_norm: fraction of PRBs needed
+        cap_remaining_norm = np.clip(caps.astype(float) / float(self.max_prb), 0.0, 1.0)
+
+        # 3) remaining after prev PRBs (if you expose prev_prbs)
+        prev_prbs = getattr(self, "prev_prbs", np.zeros_like(caps))
+        remaining_after_prev = np.maximum(caps - prev_prbs.astype(int), 0)
+        cap_remaining_after_prev_norm = np.clip(remaining_after_prev.astype(float) / float(self.max_prb), 0.0, 1.0)
+
+        # 4) Optional small-backlog binary flag (helps policy avoid starving small flows)
+        small_backlog_flag = (self.backlog <= (bpp * 1.0)).astype(float)  # needs <=1 PRB
+
+        return {
+            "bpp": bpp,
+            "caps": caps,
+            "backlog_norm": backlog_norm,
+            "backlog_norm_log": backlog_norm_log,
+            "cap_remaining_norm": cap_remaining_norm,
+            "cap_remaining_after_prev_norm": cap_remaining_after_prev_norm,
+            "small_backlog_flag": small_backlog_flag
+        }
 
     def _arrivals(self):
         # Poisson arrivals (bytes/ms) + optional periodic bursts
