@@ -256,7 +256,7 @@ class MACSchedulerEnv(gym.Env):
             arrival_bps = np.array([1e12,1e12,1e12,1e12])  # effectively infinite
             self.period_ms = np.array([0,0,0,0]); self.period_bytes = np.array([0,0,0,0])
         elif self.traffic_profile == 'mixed':
-            arrival_bps = np.array([50e6,0.0,8e6,15e6])
+            arrival_bps = np.array([50e6,0.0,8e6,15e6]) # Number of bits per second
             self.period_ms = np.array([0,20,0,0]); self.period_bytes = np.array([0,80,0,0])
         else:
             arrival_bps = np.array([40e6,10e6,12e6,20e6])
@@ -280,25 +280,29 @@ class MACSchedulerEnv(gym.Env):
         self.active_mask = np.zeros(4, dtype=int)  # start inactive
         self.thr_ema_mbps = np.ones(4, dtype=float) * 1e-6
         # self.reset_model_state()
-        
+
         self.global_step += 1
         if self.global_step == 5:
+            # Randomize scheme 0
             # bump mcs_mean (vector) by +5, wrap around 0..max_mcs
-            self.mcs_mean = ((np.array(self.mcs_mean, dtype=int) + 2) % (self.max_mcs + 1)).astype(int)
+            # self.mcs_mean = ((np.array(self.mcs_mean, dtype=int) + 2) % (self.max_mcs + 1)).astype(int)
 
-            # bump arrival_bps by +10e6 and wrap modulo 50e6
-            updated_arrivals = (np.array(self.arrival_bps, dtype=float) + 5e6) % 50e6
-            updated_arrivals[np.isclose(updated_arrivals, 0.0)] = 5e6
-            self.arrival_bps = updated_arrivals
+            # # bump arrival_bps by +10e6 and wrap modulo 50e6
+            # updated_arrivals = (np.array(self.arrival_bps, dtype=float) + 5e6) % 50e6
+            # updated_arrivals[np.isclose(updated_arrivals, 0.0)] = 5e6
+            # self.arrival_bps = updated_arrivals
 
-            # recompute lam_bytes_per_ms used by _arrivals()
+            # Randomize scheme 1
+            idx = np.random.permutation(len(self.mcs_mean))
+            self.mcs_mean[:] = self.mcs_mean[idx]
+            self.arrival_bps[:] = self.arrival_bps[idx]
+            
+            # Randomizing scheme 2
+
+            self.mcs_mean = self.rng.integers(low=2, high=28, size=4)
+            self.arrival_bps = self.rng.uniform(low=5e6, high=50e6, size=4)
+
             self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
-
-            # recompute any derived fields if needed (example: max_mb_per_tti)
-            max_bpp = bytes_per_prb(28, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
-            self.max_mb_per_tti = (self.max_prb * max_bpp * 8.0) / 1e6
-
-            # log (optional)
             print(f"[SCHEDULE] global_step={self.global_step} mcs_mean={self.mcs_mean.tolist()} arrival_bps={self.arrival_bps.tolist()}")
 
             self.global_step = 0
@@ -383,8 +387,8 @@ class MACSchedulerEnv(gym.Env):
         # ) 
 
         # 6) Arrivals now produce next state s_{t+1}
-        arrivals = self._arrivals()
-        self.backlog += arrivals
+        arrivals = self._arrivals() # Number of bytes comming to UE's buffer per TTI(ms) 
+        self.backlog += arrivals # Total number of bytes in each UE's buffer
         self.active_mask = (self.backlog > 0).astype(int)
         self.prev_prbs = prbs_out
         self._curr_mcs = self._sample_mcs()
