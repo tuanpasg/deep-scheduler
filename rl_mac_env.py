@@ -226,7 +226,7 @@ class MACSchedulerEnv(gym.Env):
         self.load_clip_bytes = 2_000_000  # 2 MB clip for normalization to [0,1]
         per_ue_dim = 2 + (1 if use_prev_prbs else 0)
         # self.obs_dim = per_ue_dim * 4 + 1 + 4
-        self.obs_dim = 2*4
+        self.obs_dim = 4*4
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.obs_dim,), dtype=np.float32)
         # Action: non-negative allocation scores per UE in [0,1]; relative proportions matter
         self.action_space = spaces.Box(low=0.0, high=1.0, shape=(4,), dtype=np.float32)
@@ -293,9 +293,9 @@ class MACSchedulerEnv(gym.Env):
             # self.arrival_bps = updated_arrivals
 
             # Randomize scheme 1
-            idx = np.random.permutation(len(self.mcs_mean))
-            self.mcs_mean[:] = self.mcs_mean[idx]
-            self.arrival_bps[:] = self.arrival_bps[idx]
+            # idx = np.random.permutation(len(self.mcs_mean))
+            # self.mcs_mean[:] = self.mcs_mean[idx]
+            # self.arrival_bps[:] = self.arrival_bps[idx]
             
             # Randomizing scheme 2
 
@@ -432,6 +432,7 @@ class MACSchedulerEnv(gym.Env):
         share = (backlog / (total + eps)).clip(0.0, 1.0)   # shape (4,)
 
         backlog_features = self.compute_backlog_and_cap_features()
+        aver_past_throughput = self.thr_ema_mbps/1000 #Megabits per ms 
 
         obs = []
         # per-UE features
@@ -440,7 +441,8 @@ class MACSchedulerEnv(gym.Env):
             load_norm = float(backlog_features["backlog_norm"][i])
             prbs_in_need_norm = float(backlog_features["cap_remaining_norm"][i])
             mcs_norm = float(np.clip(getattr(self, '_curr_mcs', np.zeros(4))[i] / 28.0, 0.0, 1.0))
-            obs.extend([load_norm, prbs_in_need_norm, mcs_norm])
+            aver_past_rate = float(aver_past_throughput[i])
+            obs.extend([mcs_norm, load_norm, prbs_in_need_norm, aver_past_rate])
             # if self.use_prev_prbs:
             #     obs.append(float(self.prev_prbs[i]) / max(1, self.max_prb))
         # global prb budget (normalized to 273)
