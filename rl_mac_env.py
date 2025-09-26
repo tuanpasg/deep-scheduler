@@ -300,9 +300,9 @@ class MACSchedulerEnv(gym.Env):
             # Randomizing scheme 2
 
             self.mcs_mean = self.rng.integers(low=2, high=28, size=4)
-            self.arrival_bps = self.rng.uniform(low=5e6, high=50e6, size=4)
+            self.arrival_bps = self.rng.integers(low=5, high=50, size=4)*1e6 # Bits per second
 
-            self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0
+            self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0 #bytes per milli-second or TTI
             print(f"[SCHEDULE] global_step={self.global_step} mcs_mean={self.mcs_mean.tolist()} arrival_bps={self.arrival_bps.tolist()}")
 
             self.global_step = 0
@@ -430,12 +430,17 @@ class MACSchedulerEnv(gym.Env):
         eps = 1e-9
         total = float(backlog.sum())
         share = (backlog / (total + eps)).clip(0.0, 1.0)   # shape (4,)
+
+        backlog_features = self.compute_backlog_and_cap_features()
+
         obs = []
         # per-UE features
         for i in range(4):
-            load_norm = share[i]
+            # load_norm = share[i]
+            load_norm = float(backlog_features["backlog_norm"][i])
+            prbs_in_need_norm = float(backlog_features["cap_remaining_norm"][i])
             mcs_norm = float(np.clip(getattr(self, '_curr_mcs', np.zeros(4))[i] / 28.0, 0.0, 1.0))
-            obs.extend([load_norm, mcs_norm])
+            obs.extend([load_norm, prbs_in_need_norm, mcs_norm])
             # if self.use_prev_prbs:
             #     obs.append(float(self.prev_prbs[i]) / max(1, self.max_prb))
         # global prb budget (normalized to 273)
@@ -453,14 +458,14 @@ class MACSchedulerEnv(gym.Env):
         self._curr_mcs = mcs.astype(int)
         return self._curr_mcs
 
-    def compute_backlog_and_cap_features(self, mcs):
+    def compute_backlog_and_cap_features(self):
         # mcs: array-like of per-UE MCS indices (integers)
         # backlog: self.backlog (bytes per UE)
         # prev_prbs: self.prev_prbs (int PRBs assigned previously) or zeros if not used
         # self.max_prb exists
-
+        mcs = self._curr_mcs.copy()
         # bytes per PRB per UE (you already use bytes_per_prb)
-        bpp_raw = np.array([bytes_per_prb(int(m), n_symb=self.n_symb, overhead=self.overhead)
+        bpp_raw = np.array([bytes_per_prb(int(m), n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
                             for m in mcs], dtype=float)
         # numerical floor
         bpp = np.maximum(bpp_raw, 4.0)   # bytes per PRB
@@ -490,6 +495,11 @@ class MACSchedulerEnv(gym.Env):
         # 4) Optional small-backlog binary flag (helps policy avoid starving small flows)
         small_backlog_flag = (self.backlog <= (bpp * 1.0)).astype(float)  # needs <=1 PRB
 
+        # print(
+        #   f"aver_arrival_tti[bytes] = {self.lam_bytes_per_ms}\n"
+        #   f"backlog[bytes]={self.backlog} upper_bound_tti[bytes]={capacity_per_tti_bytes}\n"
+        #   f"needed_prbs={caps} norm={cap_remaining_norm}"
+        # )
         return {
             "bpp": bpp,
             "caps": caps,
