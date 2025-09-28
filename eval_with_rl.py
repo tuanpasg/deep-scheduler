@@ -21,6 +21,8 @@ class RLSchedulerWrapper:
         env_kwargs = env_kwargs or {}
         self._env_helper = MACSchedulerEnv(**env_kwargs)
         # don't call reset() (we'll manually set fields)
+        action_shape = self._env_helper.action_space.shape
+        self.prev_allocated_prbs = np.zeros(action_shape, dtype=int)
         # preserve training_mode decision behavior for project_scores_to_prbs call
         self.training_mode = training_mode
 
@@ -39,21 +41,19 @@ class RLSchedulerWrapper:
         """
         # set helper state (so its compute_backlog_and_cap_features works)
         ue = state["ue"]
-        N = len(ue)
-        # backlog in bytes
-        backlog = np.array([float(ue[i]["load"]) for i in range(N)], dtype=float)
-        mcs = np.array([int(ue[i]["mcs"]) for i in range(N)], dtype=int)
-
-        # configure helper env internals to reflect this simulator state
-        self._env_helper.backlog = backlog.copy()
-        self._env_helper.prev_prbs = np.zeros(4, dtype=int)  # could be improved if prev known
-        self._env_helper._curr_mcs = mcs.copy()
-        self._env_helper.max_prb = int(state.get("prb_budget", self._env_helper.max_prb))
-        # ensure active mask aligned with backlog
-        self._env_helper.active_mask = (backlog > 0).astype(int)
+        loads = np.array([float(u["load"]) for u in ue], dtype=float)
+        mcs = np.array([int(u["mcs"]) for u in ue], dtype=int)
+        prb_budget = int(state.get("prb_budget", self._env_helper.max_prb))
+        curr_state = {
+            "loads": loads,
+            "mcs": mcs,
+            "prev_prbs": self.prev_allocated_prbs,
+            "prb_budget": prb_budget,
+        }
 
         # Build observation exactly as MACSchedulerEnv._get_obs does
-        obs = self._env_helper._get_obs().astype(np.float32)
+        obs = self._env_helper.prep_obs(curr_state).astype(np.float32)
+
         # SB3 expects shape (n_envs, obs_dim) for predict? we can pass 1D and set deterministic=True
         action, _ = self.model.predict(obs, deterministic=True)
         # action is e.g. np.array([s0,...,s3]) in [0,1]; ensure shape
@@ -61,7 +61,7 @@ class RLSchedulerWrapper:
 
         # Convert action -> prbs using the same function training used
         prbs_out, prbs_pre, wasted_prbs, invalid_allocated_prbs = project_scores_to_prbs(
-            action, int(state["prb_budget"]),
+            action, prb_budget,
             self._env_helper.backlog,
             self._env_helper._curr_mcs,
             self._env_helper.active_mask,
@@ -70,7 +70,14 @@ class RLSchedulerWrapper:
             training_mode=self.training_mode
         )
 
-        # Return prbs_out (list/ndarray of ints) — mac_test_suite will sanitize again
+        print(
+            f"[TTI {self._env_helper.t:04d}] [TRAINING MODE {self.training_mode}]\n"
+            f"action={action} wasted_prbs={wasted_prbs} allocated_prbs={prbs_out}"
+            f"\n obs={obs}"
+            f"\n curr_state={curr_state}"
+        )
+        # Return prbs_out (list/ndarray of ints) -- mac_test_suite will sanitize again
+        self.prev_allocated_prbs = prbs_out.astype(int)
         return prbs_out.astype(int)
 
 # === runner ===
