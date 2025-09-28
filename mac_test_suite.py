@@ -19,6 +19,7 @@ import pandas as pd
 import time
 import math
 import sys
+from rl_mac_env import bytes_per_prb as bytes_per_prb
 
 # -----------------------------
 # MCS efficiency model (toy)
@@ -33,7 +34,7 @@ def eff_from_mcs(mcs_idx: int) -> float:
     mcs_idx = int(max(0, min(len(TOY_MCS_EFF)-1, mcs_idx)))
     return float(TOY_MCS_EFF[mcs_idx])
 
-def bytes_per_prb(mcs_idx: int, re_per_prb: int = 12*14) -> float:
+def bytes_per_prb_toy(mcs_idx: int, re_per_prb: int = 12*14) -> float:
     # Approximate bytes per PRB per TTI = eff (bits/RE) * RE / 8
     return eff_from_mcs(mcs_idx) * re_per_prb / 8.0
 
