@@ -242,6 +242,7 @@ class MACSchedulerEnv(gym.Env):
         self.backlog = np.zeros(4, dtype=float)
         self.prev_prbs = np.zeros(4, dtype=int)
         self.active_mask = np.zeros(4, dtype=int)  # start inactive
+        self._curr_mcs = np.zeros(4, dtype=int)
 
         # Fading profile
         if self.fading_profile == 'fast':
@@ -425,6 +426,32 @@ class MACSchedulerEnv(gym.Env):
     # ----------------------
     # Internals
     # ----------------------
+    def _get_obs(self):
+        backlog = self.backlog.astype(float)  # bytes
+        eps = 1e-9
+        total = float(backlog.sum())
+        share = (backlog / (total + eps)).clip(0.0, 1.0)   # shape (4,)
+
+        backlog_features = self.compute_backlog_and_cap_features()
+        aver_past_throughput = self.thr_ema_mbps/1000 #Megabits per ms 
+
+        obs = []
+        # per-UE features
+        for i in range(4):
+            # load_norm = share[i]
+            load_norm = float(backlog_features["backlog_norm"][i])
+            prbs_in_need_norm = float(backlog_features["cap_remaining_norm"][i])
+            mcs_norm = float(np.clip(getattr(self, '_curr_mcs', np.zeros(4))[i] / 28.0, 0.0, 1.0))
+            aver_past_rate = float(aver_past_throughput[i])
+            obs.extend([mcs_norm, load_norm, prbs_in_need_norm, aver_past_rate])
+            # if self.use_prev_prbs:
+            #     obs.append(float(self.prev_prbs[i]) / max(1, self.max_prb))
+        # global prb budget (normalized to 273)
+        # obs.append(float(self.max_prb) / 273.0)
+        # active mask
+        # obs.extend(self.active_mask.astype(float).tolist())
+        return np.array(obs, dtype=np.float32)
+        
     def prep_obs(self, external_state:dict):
         # Calculate the efficient allocated bytes from the previous TTI to update backlog and average throughput
         self.prev_prbs = np.asarray(external_state["prev_prbs"],dtype=int)
