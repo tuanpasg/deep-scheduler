@@ -44,6 +44,74 @@ def jain_fairness(values):
     den = len(v) * (v**2).sum() + 1e-12
     return float(num / den)
 
+def softmax(x, temp=1.0, eps=1e-12):
+    x = np.array(x, dtype=float)
+    x = x - np.max(x)              # stability
+    ex = np.exp(x / max(temp, 1e-9))
+    s = ex.sum()
+    if s <= 0:
+        return np.ones_like(x) / len(x)
+    return ex / (s + eps)
+
+def allocate_prbs_softmax_largest_remainder(scores, caps, prb_budget, temp=0.5):
+    """
+    scores: 1D array (can be negative/positive)
+    caps: 1D int array of per-UE caps
+    prb_budget: int
+    temp: softmax temperature (smaller -> sharper)
+    """
+    scores = np.array(scores, dtype=float)
+    caps = np.array(caps, dtype=int)
+    N = len(scores)
+    prb_budget = int(prb_budget)
+    if prb_budget <= 0 or N == 0:
+        return np.zeros(N, dtype=int)
+
+    # 1) probabilities via softmax
+    probs = softmax(scores, temp=temp)
+
+    # 2) continuous requests
+    raw = probs * prb_budget
+
+    # 3) integer allocation by floor
+    allocated = np.floor(raw).astype(int)
+
+    # cap them immediately (just in case)
+    allocated = np.minimum(allocated, caps)
+
+    # 4) compute remaining PRBs to distribute
+    remaining = prb_budget - allocated.sum()
+    if remaining <= 0:
+        return allocated
+
+    # 5) largest remainder ordering (fair proportional rounding)
+    remainders = raw - np.floor(raw)
+    order = np.argsort(-remainders)  # largest fractional remainder first
+
+    for i in order:
+        if remaining <= 0:
+            break
+        if allocated[i] < caps[i]:
+            allocated[i] += 1
+            remaining -= 1
+
+    # 6) if still remaining (all reached caps), give them to any with capacity by probs desc
+    if remaining > 0:
+        order2 = np.argsort(-probs)
+        idx = 0
+        while remaining > 0 and idx < 10 * N:
+            i = order2[idx % N]
+            if allocated[i] < caps[i]:
+                allocated[i] += 1
+                remaining -= 1
+            idx += 1
+            if allocated.sum() == caps.sum():
+                break
+
+    # Safety cap
+    allocated = np.minimum(allocated, caps)
+    return allocated
+
 def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active_mask,
                            n_symb=14, overhead=18, training_mode=False):
     """
@@ -60,25 +128,27 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
     if prb_budget <= 0 or np.all(scores <= 0):
         return np.zeros(4, dtype=int), np.zeros(4, dtype=int), 0, 0
 
+    # Normalize scores linearly into fractions
     total = scores.sum()
     fracs = scores / total if total > 0 else np.zeros_like(scores)
     raw = fracs * prb_budget
+
+    # Scaling scores via softmax function
+    probs = softmax(scores,temp=1.0)
+    raw = probs * prb_budget
+
     prbs_pre = np.floor(raw).astype(int)
     
-    # print(
-    #   f"scores={scores} prbs_pre={prbs_pre}"
-    # )
-    # ensure sum(prbs_pre) == prb_budget by distributing leftover (same as before)
+    # Redistribute leftover prbs due to rounding
     leftover = prb_budget - prbs_pre.sum()
     if leftover > 0:
-        rema = raw - prbs_pre
-        for k in np.argsort(-rema):
+        remainders = raw - prbs_pre
+        for k in np.argsort(-remainders):
             if leftover == 0:
                 break
             prbs_pre[k] += 1
             leftover -= 1
 
-    # print(f"prbs_pre={prbs_pre}")
     # robust caps (backlog-based): as before
     bpp_raw = np.array([bytes_per_prb(int(m), n_symb, overhead) for m in ue_mcs_idx], dtype=float)
     bpp = np.maximum(bpp_raw, 4.0)
@@ -155,17 +225,6 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
 
         wasted_prbs = int((prbs_pre * (1 - active_mask)).sum())  # for bookkeeping
 
-    # # unassigned PRBs (system-level)
-    # unassigned_prbs = int(prb_budget - int(np.sum(prbs_out)))
-
-    # # new definition of wasted_prbs (per your request):
-    # # - only count unassigned_prbs as 'wasted_prbs' IF there exist zero-score UEs
-    # #   that have non-empty backlog (i.e., agent gave score==0 but backlog>0).
-    # zero_score_nonempty = np.logical_and(scores == 0.0, ue_load_bytes > 0.0)
-    # if np.any(zero_score_nonempty):
-    #     wasted_prbs = unassigned_prbs
-    # else:
-    #     wasted_prbs = 0
     wasted_prbs = prb_budget - invalid_allocated_prbs - int(prbs_out.sum())
 
     return prbs_out.astype(int), prbs_pre.astype(int), int(wasted_prbs), int(invalid_allocated_prbs)

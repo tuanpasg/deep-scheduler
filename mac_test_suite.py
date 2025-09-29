@@ -19,7 +19,7 @@ import pandas as pd
 import time
 import math
 import sys
-from rl_mac_env import bytes_per_prb as bytes_per_prb
+from rl_mac_env import bytes_per_prb as bytes_per_prb, tbs_38214_bytes
 
 # -----------------------------
 # MCS efficiency model (toy)
@@ -427,10 +427,10 @@ class Simulator:
         decision_runtime_s = time.perf_counter() - start_time
         prbs = _sanitize(np.asarray(prbs, dtype=int), prb_budget)
         
-        bpp = np.array([bytes_per_prb(int(m)) for m in mcs])  # bytes per PRB
-        tbs_bytes = (prbs * bpp).astype(float)
+        tbs_bytes = np.zeros(N, dtype=float)
         served = np.zeros(N, dtype=float)
         for i in range(N):
+            tbs_bytes[i] = tbs_38214_bytes(int(mcs[i]), int(prbs[i]))
             served[i] = min(self.ues[i].backlog_bytes, tbs_bytes[i])
             self.ues[i].backlog_bytes -= served[i]
             if self.ues[i].backlog_bytes == 0:
