@@ -129,12 +129,12 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
         return np.zeros(4, dtype=int), np.zeros(4, dtype=int), 0, 0
 
     # Normalize scores linearly into fractions
-    total = scores.sum()
-    fracs = scores / total if total > 0 else np.zeros_like(scores)
-    raw = fracs * prb_budget
+    # total = scores.sum()
+    # fracs = scores / total if total > 0 else np.zeros_like(scores)
+    # raw = fracs * prb_budget
 
     # Scaling scores via softmax function
-    probs = softmax(scores,temp=1.0)
+    probs = softmax(scores,temp=0.2)
     raw = probs * prb_budget
 
     prbs_pre = np.floor(raw).astype(int)
@@ -175,30 +175,30 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
         # remaining_prbs may be >0 when prbs_pre sum < prb_budget (due to caps) OR when agent
         # assigned PRBs to invalid UEs (those vanish from prbs_out but we count them as 'removed').
 
-        if remaining_prbs > 0:
-            # compute how many PRBs each valid UE still needs (caps minus current assigned)
-            remaining_caps = np.maximum(caps - prbs_out, 0).astype(int)
+        # if remaining_prbs > 0:
+        #     # compute how many PRBs each valid UE still needs (caps minus current assigned)
+        #     remaining_caps = np.maximum(caps - prbs_out, 0).astype(int)
 
-            # build candidate list: valid UEs that still need PRBs (backlog > 0 after current allocation)
-            candidates = np.where((active_mask == 1) & (remaining_caps > 0))[0]
+        #     # build candidate list: valid UEs that still need PRBs (backlog > 0 after current allocation)
+        #     candidates = np.where((active_mask == 1) & (remaining_caps > 0))[0]
 
-            if candidates.size > 0:
-                # order candidates by agent score (high -> low)
-                # if scores contains ties, np.argsort keeps deterministic order
-                order = candidates[np.argsort(-scores[candidates])]
-
-                # allocate greedily in that order until we run out or all needs satisfied
-                for ue in order:
-                    if remaining_prbs <= 0:
-                        break
-                    need = int(remaining_caps[ue])
-                    if need <= 0:
-                        continue
-                    give = min(need, remaining_prbs)
-                    prbs_out[ue] += give
-                    remaining_prbs -= give
-                    remaining_caps[ue] -= give
-                    # stop early if no more remaining_prbs
+        #     if candidates.size > 0:
+        #         # order candidates by agent score (high -> low)
+        #         # if scores contains ties, np.argsort keeps deterministic order
+        #         # order = candidates[np.argsort(-scores[candidates])]
+        #         # order = candidates[np.argsort(-probs[candidates])]
+        #         # allocate greedily in that order until we run out or all needs satisfied
+        #         for ue in order:
+        #             if remaining_prbs <= 0:
+        #                 break
+        #             need = int(remaining_caps[ue])
+        #             if need <= 0:
+        #                 continue
+        #             give = min(need, remaining_prbs)
+        #             prbs_out[ue] += give
+        #             remaining_prbs -= give
+        #             remaining_caps[ue] -= give
+        #             # stop early if no more remaining_prbs
     else:
         # deployment: mask scores early / redistribute as before (safe behavior)
         # Here we mimic previous behavior: zero scores, compute allocation with caps+active_mask and redistribution
@@ -225,7 +225,10 @@ def project_scores_to_prbs(scores, prb_budget, ue_load_bytes, ue_mcs_idx, active
 
         wasted_prbs = int((prbs_pre * (1 - active_mask)).sum())  # for bookkeeping
 
-    wasted_prbs = prb_budget - invalid_allocated_prbs - int(prbs_out.sum())
+    allocated_valid = int(prbs_out.sum())
+    remaining_prbs = prb_budget - invalid_allocated_prbs - allocated_valid
+    remaining_caps = np.maximum(caps - prbs_out, 0).astype(int)
+    wasted_prbs = min(remaining_caps.sum(),remaining_prbs)
 
     return prbs_out.astype(int), prbs_pre.astype(int), int(wasted_prbs), int(invalid_allocated_prbs)
 

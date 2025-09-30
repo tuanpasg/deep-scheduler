@@ -469,21 +469,34 @@ class Simulator:
 def build_scenario(scenario_name: str, rng: np.random.Generator):
     scenario_name = scenario_name.strip().lower()
     if scenario_name == "full_buffer_static":
-        cfg = SimulatorConfig(n_ue=4, duration_tti=1000, available_prbs=273)
+        cfg = SimulatorConfig(n_ue=4, duration_tti=2000, available_prbs=273)
         traffic = FullBufferTraffic(n_ue=4)
         channel = StaticMCS([5, 10, 15, 20])
 
     elif scenario_name == "full_buffer_fastfade":
-        cfg = SimulatorConfig(n_ue=4, duration_tti=1000, available_prbs=273)
+        cfg = SimulatorConfig(n_ue=4, duration_tti=2000, available_prbs=273)
         traffic = FullBufferTraffic(n_ue=4)   # saturated buffers
         # per-TTI fast fading around different means to create multi-user diversity
         channel = FastFadingMCS(
             n_ue=4,
-            mean=[5, 10, 15, 20],  # heterogeneous averages (poor → good)
+            mean=[5, 10, 15, 25],  # heterogeneous averages (poor → good)
             spread=6,              # +/-6 MCS steps per TTI
             rng=rng
         )
 
+    elif scenario_name == "mixed_traffic_lowfade":
+        cfg = SimulatorConfig(n_ue=4, duration_tti=2000, available_prbs=273)
+        traffic = CombinedTraffic([
+            PoissonTraffic(n_ue=1, mean_bps=[40e6], rng=rng),
+            PoissonTraffic(n_ue=1, mean_bps=[10e6], rng=rng),
+            PoissonTraffic(n_ue=1, mean_bps=[30e6], rng=rng),
+            PoissonTraffic(n_ue=1, mean_bps=[50e6], rng=rng)
+        ])
+        channel = FastFadingMCS(n_ue=4, 
+        mean=[2, 15, 7, 25], 
+        spread=2, 
+        rng=rng)
+           
     elif scenario_name == "mixed_traffic_fastfade":
         cfg = SimulatorConfig(n_ue=4, duration_tti=1500, available_prbs=273)
         traffic = CombinedTraffic([
