@@ -6,7 +6,7 @@
 import argparse
 import numpy as np
 from stable_baselines3 import PPO
-from mac_test_suite import Simulator, SimulatorConfig, build_scenario  # mac_test_suite API
+from mac_test_suite import Simulator, SimulatorConfig, build_scenario, available_schedulers, compute_metrics  # mac_test_suite API
 from rl_mac_env import MACSchedulerEnv, project_scores_to_prbs  # reuse env helpers
 import pandas as pd
 import time
@@ -84,7 +84,6 @@ class RLSchedulerWrapper:
 def run_once_for_scheduler(cfg, traffic, channel, scheduler, duration_tti=1000, rng=None):
     sim = Simulator(cfg, traffic, channel, rng=rng)
     logs = sim.run(scheduler)
-    from mac_test_suite import compute_metrics
     metrics = compute_metrics(logs, tti_ms=cfg.tti_ms)
     return metrics
 
@@ -103,40 +102,48 @@ def main():
     
     rows = []
     for sc in scenarios:
-        # build scenario
-        cfg, traffic, channel = build_scenario(sc, rng)
-        # baseline schedulers
-        from mac_test_suite import available_schedulers
-        baselines = available_schedulers(cfg.n_ue)
-        # RL wrapper
-        rl = RLSchedulerWrapper(args.model, training_mode=bool(args.training_mode),
-                                env_kwargs={"tti_ms": cfg.tti_ms, "duration_tti": cfg.duration_tti, "prb_budget": cfg.available_prbs})
-        scheds = baselines + [rl]
+        from mac_test_suite import available_schedulers, build_scenario, compute_metrics, Simulator
+        agg = {}  # store metrics lists per scheduler
 
-        for sch in scheds:
-            # run multiple times (difference via different seed offsets)
-            agg = []
-            for r in range(args.runs):
-                # micro-seed for each run
-                run_rng = np.random.default_rng(args.seed + r + 123)
-                sim = Simulator(cfg, traffic, channel, rng=run_rng)
+        for r in range(args.runs):
+            run_rng = np.random.default_rng(args.seed + r + 123)
+            # build scenario once for this run
+            cfg, traffic, channel = build_scenario(sc, run_rng)
+
+            # baseline schedulers + RL
+            baselines = available_schedulers(cfg.n_ue)
+            rl = RLSchedulerWrapper(
+                args.model,
+                training_mode=bool(args.training_mode),
+                env_kwargs={
+                    "tti_ms": cfg.tti_ms,
+                    "duration_tti": cfg.duration_tti,
+                    "prb_budget": cfg.available_prbs,
+                },
+            )
+            scheds = baselines + [rl]
+
+            for sch in scheds:
+                sim = Simulator(cfg, traffic, channel, rng=np.random.default_rng(args.seed + r + 456))
                 logs = sim.run(sch)
-                from mac_test_suite import compute_metrics
                 metrics = compute_metrics(logs, tti_ms=cfg.tti_ms)
-                agg.append(metrics)
-                print(f"[{sc} | {sch.name()} | run {r}] tput={metrics['cell_throughput_Mbps']:.2f} Mbps, jain={metrics['jain_fairness']:.3f}")
+                agg.setdefault(sch.name(), []).append(metrics)
 
-            # average numeric metrics across repeats
-            # pick keys to save (same as mac_test_suite)
-            avg = {}
-            keys = ["cell_throughput_Mbps", "jain_fairness", "prb_utilization", "mean_latency_ms", "p95_latency_ms", "avg_decision_runtime_us"]
-            for k in keys:
-                avg[k] = float(np.mean([a[k] for a in agg]))
-            row = {"scenario": sc, "scheduler": sch.name(), **avg}
+                print(f"[{sc} | {sch.name()} | run {r}] "
+                      f"tput={metrics['cell_throughput_Mbps']:.2f} Mbps, "
+                      f"jain={metrics['jain_fairness']:.3f}")
+
+        # after all runs → average metrics per scheduler
+        keys = ["cell_throughput_Mbps", "jain_fairness",
+                "prb_utilization", "mean_latency_ms",
+                "p95_latency_ms", "avg_decision_runtime_us"]
+        for sname, metrics_list in agg.items():
+            avg = {k: float(np.mean([m[k] for m in metrics_list])) for k in keys}
+            row = {"scenario": sc, "scheduler": sname, **avg}
             rows.append(row)
-
+            
     df = pd.DataFrame(rows)
-    df.to_csv(args.out, index=False)
+    df.to_csv(args.out, index=False)        
     print(f"Saved results to: {args.out}")
 
 if __name__ == "__main__":
