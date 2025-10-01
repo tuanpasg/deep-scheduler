@@ -345,7 +345,7 @@ class MACSchedulerEnv(gym.Env):
         # self.reset_model_state()
 
         self.global_step += 1
-        if self.global_step == 5:
+        if self.global_step == 1:
             # Randomize scheme 0
             # bump mcs_mean (vector) by +5, wrap around 0..max_mcs
             # self.mcs_mean = ((np.array(self.mcs_mean, dtype=int) + 2) % (self.max_mcs + 1)).astype(int)
@@ -362,8 +362,8 @@ class MACSchedulerEnv(gym.Env):
             
             # Randomizing scheme 2
 
-            self.mcs_mean = self.rng.integers(low=2, high=28, size=4)
-            self.arrival_bps = self.rng.integers(low=5, high=50, size=4)*1e6 # Bits per second
+            self.mcs_mean = self.rng.integers(low=5, high=25, size=4)
+            self.arrival_bps = self.rng.integers(low=10, high=50, size=4)*1e6 # Bits per second
 
             self.lam_bytes_per_ms = self.arrival_bps / 8.0 / 1000.0 #bytes per milli-second or TTI
             print(f"[SCHEDULE] global_step={self.global_step} mcs_mean={self.mcs_mean.tolist()} arrival_bps={self.arrival_bps.tolist()}")

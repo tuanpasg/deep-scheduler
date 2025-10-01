@@ -486,17 +486,20 @@ def build_scenario(scenario_name: str, rng: np.random.Generator):
 
     elif scenario_name == "mixed_traffic_lowfade":
         cfg = SimulatorConfig(n_ue=4, duration_tti=2000, available_prbs=273)
+        aver_rate_bps = rng.integers(10, 50, size=4) * 1e6
         traffic = CombinedTraffic([
-            PoissonTraffic(n_ue=1, mean_bps=[40e6], rng=rng),
-            PoissonTraffic(n_ue=1, mean_bps=[10e6], rng=rng),
-            PoissonTraffic(n_ue=1, mean_bps=[30e6], rng=rng),
-            PoissonTraffic(n_ue=1, mean_bps=[50e6], rng=rng)
+            PoissonTraffic(n_ue=1, mean_bps=[aver_rate_bps[0]], rng=rng),
+            PoissonTraffic(n_ue=1, mean_bps=[aver_rate_bps[1]], rng=rng),
+            PoissonTraffic(n_ue=1, mean_bps=[aver_rate_bps[2]], rng=rng),
+            PoissonTraffic(n_ue=1, mean_bps=[aver_rate_bps[3]], rng=rng),
         ])
-        channel = FastFadingMCS(n_ue=4, 
-        mean=[2, 15, 7, 25], 
-        spread=2, 
-        rng=rng)
-           
+        channel = FastFadingMCS(
+            n_ue=4,
+            mean=rng.integers(5, 25, size=4),
+            spread=2,
+            rng=rng,
+        )
+
     elif scenario_name == "mixed_traffic_fastfade":
         cfg = SimulatorConfig(n_ue=4, duration_tti=1500, available_prbs=273)
         traffic = CombinedTraffic([

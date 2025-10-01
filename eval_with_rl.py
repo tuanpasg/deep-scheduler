@@ -98,8 +98,9 @@ def main():
     args = p.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    scenarios = ["full_buffer_static", "full_buffer_fastfade", "mixed_traffic_fastfade"]
 
+    scenarios = ["full_buffer_static", "full_buffer_fastfade", "mixed_traffic_fastfade","mixed_traffic_lowfade"]
+    
     rows = []
     for sc in scenarios:
         # build scenario
