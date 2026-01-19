@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+# eval_with_rl.py
+# Evaluate a trained PPO policy (from train_rl_scheduler.py) inside mac_test_suite Simulator.
+# Saves a CSV similar to mac_test_suite output for easy comparison.
+
+import argparse
+import numpy as np
+from stable_baselines3 import PPO
+from mac_test_suite import Simulator, SimulatorConfig, build_scenario, available_schedulers, compute_metrics  # mac_test_suite API
+from rl_mac_env import MACSchedulerEnv, project_scores_to_prbs  # reuse env helpers
+import pandas as pd
+import time
+import os
+
+# === RL Scheduler wrapper that matches mac_test_suite.Scheduler.decide API ===
+class RLSchedulerWrapper:
+    def __init__(self, model_path, training_mode=True, env_kwargs=None):
+        # load SB3 model
+        self.model = PPO.load(model_path)
+        # create a helper MACSchedulerEnv instance (for obs preprocessing and cap computations)
+        env_kwargs = env_kwargs or {}
+        self._env_helper = MACSchedulerEnv(**env_kwargs)
+        # don't call reset() (we'll manually set fields)
+        action_shape = self._env_helper.action_space.shape
+        self.prev_allocated_prbs = np.zeros(action_shape, dtype=int)
+        # preserve training_mode decision behavior for project_scores_to_prbs call
+        self.training_mode = training_mode
+
+    def name(self):
+        return "PPO_RL"
+
+    def decide(self, state: dict):
+        """
+        state from mac_test_suite.Simulator.step():
+          {"prb_budget": int, "ue": [{"load":bytes, "mcs":int, "hol_ms":...}, ...]}
+        We will:
+          - set helper env's internal fields (backlog/_curr_mcs/prev_prbs/active_mask)
+          - call helper._get_obs() to get normalized obs
+          - pass obs to policy -> action scores
+          - call project_scores_to_prbs(...) for consistent mapping
+        """
+        # set helper state (so its compute_backlog_and_cap_features works)
+        ue = state["ue"]
+        loads = np.array([float(u["load"]) for u in ue], dtype=float)
+        mcs = np.array([int(u["mcs"]) for u in ue], dtype=int)
+        prb_budget = int(state.get("prb_budget", self._env_helper.max_prb))
+        curr_state = {
+            "loads": loads,
+            "mcs": mcs,
+            "prev_prbs": self.prev_allocated_prbs,
+            "prb_budget": prb_budget,
+        }
+
+        # Build observation exactly as MACSchedulerEnv._get_obs does
+        obs = self._env_helper.prep_obs(curr_state).astype(np.float32)
+
+        # SB3 expects shape (n_envs, obs_dim) for predict? we can pass 1D and set deterministic=True
+        action, _ = self.model.predict(obs, deterministic=True)
+        # action is e.g. np.array([s0,...,s3]) in [0,1]; ensure shape
+        action = np.clip(np.asarray(action, dtype=float), 0.0, 1.0).ravel()
+
+        # Convert action -> prbs using the same function training used
+        prbs_out, prbs_pre, wasted_prbs, invalid_allocated_prbs = project_scores_to_prbs(
+            action, prb_budget,
+            self._env_helper.backlog,
+            self._env_helper._curr_mcs,
+            self._env_helper.active_mask,
+            n_symb=self._env_helper.n_symb,
+            overhead=self._env_helper.overhead,
+            training_mode=self.training_mode
+        )
+
+        print(
+            f"[TTI {self._env_helper.t:04d}] [TRAINING MODE {self.training_mode}]\n"
+            f"action={action} wasted_prbs={wasted_prbs} allocated_prbs={prbs_out}"
+            f"\n obs={obs}"
+            f"\n curr_state={curr_state}"
+        )
+        # Return prbs_out (list/ndarray of ints) -- mac_test_suite will sanitize again
+        self.prev_allocated_prbs = prbs_out.astype(int)
+        return prbs_out.astype(int)
+
+# === runner ===
+def run_once_for_scheduler(cfg, traffic, channel, scheduler, duration_tti=1000, rng=None):
+    sim = Simulator(cfg, traffic, channel, rng=rng)
+    logs = sim.run(scheduler)
+    metrics = compute_metrics(logs, tti_ms=cfg.tti_ms)
+    return metrics
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", required=True, help="Path to PPO .zip saved model")
+    p.add_argument("--out", default="mac_results_with_rl.csv")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--runs", type=int, default=3, help="Number of repeats per scenario")
+    p.add_argument("--training_mode", type=int, default=1, help="Use training_mode when mapping scores->prbs")
+    args = p.parse_args()
+
+    rng = np.random.default_rng(args.seed)
+
+    scenarios = ["full_buffer_static", "full_buffer_fastfade", "mixed_traffic_fastfade","mixed_traffic_lowfade"]
+    
+    rows = []
+    for sc in scenarios:
+        from mac_test_suite import available_schedulers, build_scenario, compute_metrics, Simulator
+        agg = {}  # store metrics lists per scheduler
+
+        for r in range(args.runs):
+            run_rng = np.random.default_rng(args.seed + r + 123)
+            # build scenario once for this run
+            cfg, traffic, channel = build_scenario(sc, run_rng)
+
+            # baseline schedulers + RL
+            baselines = available_schedulers(cfg.n_ue)
+            rl = RLSchedulerWrapper(
+                args.model,
+                training_mode=bool(args.training_mode),
+                env_kwargs={
+                    "tti_ms": cfg.tti_ms,
+                    "duration_tti": cfg.duration_tti,
+                    "prb_budget": cfg.available_prbs,
+                },
+            )
+            scheds = baselines + [rl]
+
+            for sch in scheds:
+                sim = Simulator(cfg, traffic, channel, rng=np.random.default_rng(args.seed + r + 456))
+                logs = sim.run(sch)
+                metrics = compute_metrics(logs, tti_ms=cfg.tti_ms)
+                agg.setdefault(sch.name(), []).append(metrics)
+
+                print(f"[{sc} | {sch.name()} | run {r}] "
+                      f"tput={metrics['cell_throughput_Mbps']:.2f} Mbps, "
+                      f"jain={metrics['jain_fairness']:.3f}")
+
+        # after all runs → average metrics per scheduler
+        keys = ["cell_throughput_Mbps", "jain_fairness",
+                "prb_utilization", "mean_latency_ms",
+                "p95_latency_ms", "avg_decision_runtime_us"]
+        for sname, metrics_list in agg.items():
+            avg = {k: float(np.mean([m[k] for m in metrics_list])) for k in keys}
+            row = {"scenario": sc, "scheduler": sname, **avg}
+            rows.append(row)
+            
+    df = pd.DataFrame(rows)
+    df.to_csv(args.out, index=False)        
+    print(f"Saved results to: {args.out}")
+
+if __name__ == "__main__":
+    main()
