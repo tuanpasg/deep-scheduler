@@ -19,7 +19,7 @@ def _make_actor(obs_dim: int, act_dim: int) -> Actor:
 def test_masking_invariant_a_no_invalid_action_can_be_sampled():
     """(a) If mask[a] is False, the masked categorical must never sample a."""
     torch.manual_seed(0)
-    obs_dim, act_dim = 8, 11
+    obs_dim, act_dim = 2624, 1170
     actor = _make_actor(obs_dim, act_dim)
 
     # Build a mask with both valid and invalid actions.
