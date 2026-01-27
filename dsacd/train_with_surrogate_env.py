@@ -4,8 +4,6 @@ from collections import deque
 
 import torch
 
-from surrogate_env_adapter import SurrogateEnvAdapter
-
 from toy5g_env_adapter import DeterministicToy5GEnvAdapter
 
 from DSACD_multibranch import (
@@ -16,6 +14,80 @@ from DSACD_multibranch import (
     ensure_nonempty_mask,
     apply_action_mask_to_logits,
 )
+
+@torch.no_grad()
+def evaluate_pf_match(eval_env, actor, *, n_eval_ttis=50, tol=1e-9):
+    """
+    Runs an independent evaluation rollout on eval_env and measures how often
+    the actor's chosen action equals the PF-greedy action (ties allowed).
+
+    Returns:
+      pf_match: matches / total decisions
+      avg_valid: average number of valid actions per decision
+      rand_baseline: average (1 / valid_count) per decision (better than 1/avg_valid)
+    """
+    dev = next(actor.parameters()).device
+
+    # Reset eval env to a stable starting point each evaluation
+    eval_env.reset()
+
+    matches = 0
+    total = 0
+    valid_sum = 0
+    rand_sum = 0.0
+
+    for _ in range(n_eval_ttis):
+        # PF reference must be "before TTI" (same semantics as reward code)
+        avg_ref = eval_env.avg_tp.detach().clone()
+
+        eval_env.begin_tti()
+
+        for layer_ctx in eval_env.layer_iter():
+            obs = layer_ctx.obs.unsqueeze(0).to(dev)          # [1, obs_dim]
+            masks = layer_ctx.masks_rbg.to(dev)               # [M, A] bool
+
+            logits_all = actor.forward_all(obs).squeeze(0)    # [M, A]
+            logits_all = apply_action_mask_to_logits(logits_all, masks)
+
+            # sample actions (same as training); if you want deterministic eval, replace with argmax
+            actions = torch.distributions.Categorical(logits=logits_all).sample()  # [M]
+
+            # PF-greedy check per RBG
+            for m in range(eval_env.n_rbg):
+                mask_m = masks[m]  # [A]
+                valid_idx = torch.nonzero(mask_m, as_tuple=False).view(-1)
+
+                vcnt = int(valid_idx.numel())
+                valid_sum += vcnt
+                rand_sum += 1.0 / max(vcnt, 1)
+
+                chosen = int(actions[m].item())
+
+                # Compute PF for all valid actions and take argmax set (ties allowed)
+                # PF(u,m)=rate(u,m)/(avg_ref[u]+eps); NOOP is allowed but pf=0 in env._pf
+                pf_vals = []
+                for a in valid_idx.tolist():
+                    pf_vals.append(eval_env._pf(a, m, avg_ref))
+                pf_vals_t = torch.tensor(pf_vals, device=dev, dtype=torch.float32)
+
+                max_pf = float(pf_vals_t.max().item())
+                # tie set: those within tol of max
+                best_mask = (pf_vals_t >= (max_pf - tol))
+                best_actions = set([valid_idx[i].item() for i in torch.nonzero(best_mask, as_tuple=False).view(-1).tolist()])
+
+                if chosen in best_actions:
+                    matches += 1
+                total += 1
+
+            # Advance env using the actor actions (so eval state distribution is realistic)
+            eval_env.apply_layer_actions(layer_ctx, actions.cpu())
+
+        eval_env.end_tti()
+
+    pf_match = matches / max(total, 1)
+    avg_valid = valid_sum / max(total, 1)
+    rand_baseline = rand_sum / max(total, 1)
+    return pf_match, avg_valid, rand_baseline
 
 # -------------------------
 # Diagnostic: greedy match rate
@@ -130,15 +202,6 @@ def sample_actions_for_layer(actor: MultiBranchActor,
 def main(args):
     device = torch.device(args.device)
 
-    # env = SurrogateEnvAdapter(
-    #     obs_dim=args.obs_dim,
-    #     act_dim=args.act_dim,
-    #     n_layers=args.n_layers,
-    #     n_rbg=args.n_rbg,
-    #     fallback_action=args.fallback_action,
-    #     device=args.device,
-    #     seed=args.seed,
-    # )
 
     env = DeterministicToy5GEnvAdapter(
         obs_dim=args.obs_dim,
@@ -149,6 +212,16 @@ def main(args):
         seed=args.seed,
         k=0.2,       # paper factor
         gmax=1.0,    # training-only normalizer (toy: keep 1.0)
+    )
+
+    eval_env = DeterministicToy5GEnvAdapter(
+    obs_dim=args.obs_dim,
+    act_dim=args.act_dim,
+    n_layers=args.n_layers,
+    n_rbg=args.n_rbg,
+    fallback_action=args.fallback_action,
+    device=args.device,
+    seed=args.seed + 12345,   # different seed OK; use same if you want exact-repeat eval
     )
 
     # Networks
@@ -222,20 +295,28 @@ def main(args):
         # print("actor_delta_l2:", actor_param_delta())
 
         if tti % args.log_every == 0:
-          msg = f"[TTI {tti}] Buffer={replay.size}"
+            msg = f"[TTI {tti}] Buffer={replay.size}"
 
-          if replay.size >= args.learning_starts:
-            msg += (
-                f" alpha={metrics['alpha']:.4f}"
-                f" loss_q={metrics['loss_q']:.4f}"
-                f" loss_pi={metrics['loss_pi']:.4f}"
-            )
+            if replay.size >= args.learning_starts:
+                msg += (
+                    f" alpha={metrics['alpha']:.4f}"
+                    f" loss_q={metrics['loss_q']:.4f}"
+                    f" loss_pi={metrics['loss_pi']:.4f}"
+                )
 
-            # ---- ADD THIS LINE ----
-            gmr, avg_valid, base = greedy_match_rate(env, updater.actor, n_samples=3)
-            msg += f" greedy_match={gmr:.3f} avg_valid={avg_valid:.1f} rand≈{base:.3f}"
+                # ---- ADD THIS LINE ----
+                # gmr, avg_valid, base = greedy_match_rate(env, updater.actor, n_samples=3)
+                # msg += f" greedy_match={gmr:.3f} avg_valid={avg_valid:.1f} rand≈{base:.3f}"
 
-          print(msg)
+            print(msg)
+
+        if (tti % args.eval_every == 0) and (replay.size >= args.learning_starts):
+            msg = f"[TTI {tti}]"
+            pfm, avg_valid, rbase = evaluate_pf_match(eval_env, 
+                                                        updater.actor, 
+                                                        n_eval_ttis=args.eval_ttis)
+            msg += f" | EVAL pf_match={pfm:.3f} avg_valid={avg_valid:.1f} rand≈{rbase:.3f}"
+            print(msg)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -264,6 +345,9 @@ if __name__ == "__main__":
     p.add_argument("--lr_actor", type=float, default=1e-4)
     p.add_argument("--lr_critic", type=float, default=1e-4)
     p.add_argument("--lr_alpha", type=float, default=1e-4)
+
+    p.add_argument("--eval_every", type=int, default=50)
+    p.add_argument("--eval_ttis", type=int, default=50)
 
     args = p.parse_args()
     main(args)
