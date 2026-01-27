@@ -15,129 +15,130 @@ from DSACD_multibranch import (
     apply_action_mask_to_logits,
 )
 
+
+def _jain_fairness(x: torch.Tensor, eps: float = 1e-12) -> float:
+    """Jain's fairness index for non-negative vector x."""
+    x = x.float().clamp_min(0.0)
+    num = float(x.sum().item()) ** 2
+    den = float(x.numel()) * float((x * x).sum().item()) + eps
+    return num / den
+
+
 @torch.no_grad()
-def evaluate_pf_match(eval_env, actor, *, n_eval_ttis=50, tol=1e-9):
-    """
-    Runs an independent evaluation rollout on eval_env and measures how often
-    the actor's chosen action equals the PF-greedy action (ties allowed).
+def evaluate_scheduler_metrics(
+    eval_env: DeterministicToy5GEnvAdapter,
+    actor: MultiBranchActor,
+    *,
+    eval_ttis: int,
+    mode: str,
+) -> dict:
+    """Reward-agnostic evaluator.
 
-    Returns:
-      pf_match: matches / total decisions
-      avg_valid: average number of valid actions per decision
-      rand_baseline: average (1 / valid_count) per decision (better than 1/avg_valid)
+    Metrics over `eval_ttis` TTIs:
+      throughput:
+        - total_cell_tput (sum over scheduled rate[u,m] across all (m,l), over horizon)
+        - total_ue_tput (vector, sum throughput per UE over horizon)
+      fairness:
+        - alloc_counts (vector, number of times UE got any (m,l) branch)
+        - jain_throughput (Jain on total UE throughput)
+      PF utility:
+        - pf_utility = sum_u log( (total_ue_tput[u]/eval_ttis) + eps )
+      sanity:
+        - invalid_action_rate (chosen action not in mask)
+        - no_schedule_rate (chosen action == NOOP)
+        - avg_layers_per_rbg (avg #scheduled layers per RBG)
     """
+    assert mode in {"sample", "greedy"}, f"mode must be 'sample' or 'greedy', got {mode!r}"
+
     dev = next(actor.parameters()).device
-
-    # Reset eval env to a stable starting point each evaluation
     eval_env.reset()
 
-    matches = 0
-    total = 0
-    valid_sum = 0
-    rand_sum = 0.0
+    U = eval_env.n_ue
+    M = eval_env.n_rbg
+    L = eval_env.n_layers
+    noop = eval_env.noop
+    eps = eval_env.eps
 
-    for _ in range(n_eval_ttis):
-        # PF reference must be "before TTI" (same semantics as reward code)
-        avg_ref = eval_env.avg_tp.detach().clone()
+    total_cell_tput = 0.0
+    total_ue_tput = torch.zeros((U,), dtype=torch.float32)
+    alloc_counts = torch.zeros((U,), dtype=torch.float32)
 
+    invalid = 0
+    nosched = 0
+    decisions = 0
+
+    # pairing metric: average number of layers scheduled per RBG
+    layers_per_rbg_sum = 0.0
+    layers_per_rbg_den = 0
+
+    for _ in range(eval_ttis):
         eval_env.begin_tti()
 
         for layer_ctx in eval_env.layer_iter():
-            obs = layer_ctx.obs.unsqueeze(0).to(dev)          # [1, obs_dim]
-            masks = layer_ctx.masks_rbg.to(dev)               # [M, A] bool
+            obs = layer_ctx.obs.unsqueeze(0).to(dev)            # [1, obs_dim]
+            masks = layer_ctx.masks_rbg.to(dev)                 # [M, A] bool
 
-            logits_all = actor.forward_all(obs).squeeze(0)    # [M, A]
+            logits_all = actor.forward_all(obs).squeeze(0)      # [M, A]
             logits_all = apply_action_mask_to_logits(logits_all, masks)
 
-            # sample actions (same as training); if you want deterministic eval, replace with argmax
-            actions = torch.distributions.Categorical(logits=logits_all).sample()  # [M]
+            if mode == "greedy":
+                actions = torch.argmax(logits_all, dim=-1)      # [M]
+            else:
+                actions = torch.distributions.Categorical(logits=logits_all).sample()  # [M]
 
-            # PF-greedy check per RBG
-            for m in range(eval_env.n_rbg):
-                mask_m = masks[m]  # [A]
-                valid_idx = torch.nonzero(mask_m, as_tuple=False).view(-1)
+            # sanity stats
+            for m in range(M):
+                a = int(actions[m].item())
+                decisions += 1
+                if not bool(masks[m, a].item()):
+                    invalid += 1
+                if a == noop:
+                    nosched += 1
 
-                vcnt = int(valid_idx.numel())
-                valid_sum += vcnt
-                rand_sum += 1.0 / max(vcnt, 1)
-
-                chosen = int(actions[m].item())
-
-                # Compute PF for all valid actions and take argmax set (ties allowed)
-                # PF(u,m)=rate(u,m)/(avg_ref[u]+eps); NOOP is allowed but pf=0 in env._pf
-                pf_vals = []
-                for a in valid_idx.tolist():
-                    pf_vals.append(eval_env._pf(a, m, avg_ref))
-                pf_vals_t = torch.tensor(pf_vals, device=dev, dtype=torch.float32)
-
-                max_pf = float(pf_vals_t.max().item())
-                # tie set: those within tol of max
-                best_mask = (pf_vals_t >= (max_pf - tol))
-                best_actions = set([valid_idx[i].item() for i in torch.nonzero(best_mask, as_tuple=False).view(-1).tolist()])
-
-                if chosen in best_actions:
-                    matches += 1
-                total += 1
-
-            # Advance env using the actor actions (so eval state distribution is realistic)
             eval_env.apply_layer_actions(layer_ctx, actions.cpu())
 
+        # After all layers, env._alloc holds the chosen schedule for this TTI
+        alloc = eval_env._alloc.detach().cpu()  # [L, M]
+        ue_tti = torch.zeros((U,), dtype=torch.float32)
+
+        # pairing metric per RBG
+        for m in range(M):
+            scheduled_layers = 0
+            for l in range(L):
+                u = int(alloc[l, m].item())
+                if u == noop:
+                    continue
+                scheduled_layers += 1
+                ue_tti[u] += float(eval_env._rate(u, m).detach().cpu().item())
+                alloc_counts[u] += 1.0
+            layers_per_rbg_sum += float(scheduled_layers)
+            layers_per_rbg_den += 1
+
+        total_ue_tput += ue_tti
+        total_cell_tput += float(ue_tti.sum().item())
+
+        # advance env dynamics (buffers/avg_tp/reward generation)
         eval_env.end_tti()
 
-    pf_match = matches / max(total, 1)
-    avg_valid = valid_sum / max(total, 1)
-    rand_baseline = rand_sum / max(total, 1)
-    return pf_match, avg_valid, rand_baseline
+    invalid_action_rate = invalid / max(decisions, 1)
+    no_schedule_rate = nosched / max(decisions, 1)
+    avg_layers_per_rbg = layers_per_rbg_sum / max(layers_per_rbg_den, 1)
 
-# -------------------------
-# Diagnostic: greedy match rate
-# -------------------------
-@torch.no_grad()
-def greedy_match_rate(env, actor, n_samples=3):
-    dev = next(actor.parameters()).device
+    jain_throughput = _jain_fairness(total_ue_tput)
+    pf_utility = float(torch.log((total_ue_tput / max(eval_ttis, 1)) + eps).sum().item())
 
-    # ---- snapshot env state (minimal set for this toy env) ----
-    t0 = env.t
-    buf0 = env.buf.detach().clone()
-    avg0 = env.avg_tp.detach().clone()
-    alloc0 = env._alloc.detach().clone()
-
-    matches = 0
-    total = 0
-    valid_cnt_sum = 0
-
-    for _ in range(n_samples):
-        # Use the SAME reference as reward uses: "before TTI"
-        avg_ref = env.avg_tp.detach().clone()
-
-        env.begin_tti()
-
-        for layer_ctx in env.layer_iter():
-            obs = layer_ctx.obs.unsqueeze(0).to(dev)     # [1, obs_dim]
-            masks = layer_ctx.masks_rbg.to(dev)          # [M, A]
-
-            logits_all = actor.forward_all(obs).squeeze(0)  # [M, A]
-            logits_all = apply_action_mask_to_logits(logits_all, masks)
-            actions = torch.distributions.Categorical(logits=logits_all).sample()  # [M]
-
-            for m in range(env.n_rbg):
-                chosen = int(actions[m].item())
-                v_m = env._greedy_indicator_v(m, chosen, avg_ref)  # <- snapshot ref
-                matches += (v_m > 0)
-                total += 1
-                valid_cnt_sum += int(masks[m].sum().item())
-
-        # IMPORTANT: do NOT call env.end_tti() (it mutates buf/avg_tp a lot)
-
-    # ---- restore env state ----
-    env.t = t0
-    env.buf = buf0
-    env.avg_tp = avg0
-    env._alloc = alloc0
-
-    avg_valid = valid_cnt_sum / max(total, 1)
-    baseline = 1.0 / max(avg_valid, 1.0)
-    return float(matches) / max(total, 1), avg_valid, baseline
+    return {
+        "mode": mode,
+        "eval_ttis": int(eval_ttis),
+        "total_cell_tput": float(total_cell_tput),
+        "total_ue_tput": total_ue_tput,          # tensor [U]
+        "alloc_counts": alloc_counts,            # tensor [U]
+        "jain_throughput": float(jain_throughput),
+        "pf_utility": float(pf_utility),
+        "invalid_action_rate": float(invalid_action_rate),
+        "no_schedule_rate": float(no_schedule_rate),
+        "avg_layers_per_rbg": float(avg_layers_per_rbg),
+    }
 
 # -------------------------
 # Minimal uniform replay
@@ -308,10 +309,34 @@ def main(args):
 
         if (tti % args.eval_every == 0) and (replay.size >= args.learning_starts):
             msg = f"[TTI {tti}]"
-            pfm, avg_valid, rbase = evaluate_pf_match(eval_env, 
-                                                        updater.actor, 
-                                                        n_eval_ttis=args.eval_ttis)
-            msg += f" | EVAL pf_match={pfm:.3f} avg_valid={avg_valid:.1f} rand≈{rbase:.3f}"
+            m_sample = evaluate_scheduler_metrics(
+                eval_env,
+                updater.actor,
+                eval_ttis=args.eval_ttis,
+                mode="sample",
+            )
+            m_greedy = evaluate_scheduler_metrics(
+                eval_env,
+                updater.actor,
+                eval_ttis=args.eval_ttis,
+                mode="greedy",
+            )
+
+            # Compact summary: throughput + key sanity + pairing + fairness
+            msg += (
+                f" | SAMPLE cell_tput={m_sample['total_cell_tput']:.2f}"
+                f" jain={m_sample['jain_throughput']:.3f}"
+                f" pfU={m_sample['pf_utility']:.2f}"
+                f" inv={m_sample['invalid_action_rate']:.3f}"
+                f" noop={m_sample['no_schedule_rate']:.3f}"
+                f" layers/RBG={m_sample['avg_layers_per_rbg']:.2f}"
+                f" || GREEDY cell_tput={m_greedy['total_cell_tput']:.2f}"
+                f" jain={m_greedy['jain_throughput']:.3f}"
+                f" pfU={m_greedy['pf_utility']:.2f}"
+                f" inv={m_greedy['invalid_action_rate']:.3f}"
+                f" noop={m_greedy['no_schedule_rate']:.3f}"
+                f" layers/RBG={m_greedy['avg_layers_per_rbg']:.2f}"
+            )
             print(msg)
 
 if __name__ == "__main__":

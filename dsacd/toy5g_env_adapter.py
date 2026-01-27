@@ -154,19 +154,53 @@ class DeterministicToy5GEnvAdapter:
             # 2) update EMA throughput using this layer contribution (paper says reward after each layer iteration)
             self.avg_tp = self.ema_beta * self.avg_tp + (1.0 - self.ema_beta) * tp_layer
 
-            # 3) geometric mean of user throughput at current TTI (use avg_tp or tp_layer? paper uses realized throughput)
-            # We'll use avg_tp as the "current throughput state" after this layer update to be stable.
-            G = self._geom_mean(self.avg_tp.clamp_min(self.eps))
-            P = (G / max(self.gmax, self.eps))
-
-            # 4) compute v_m by greedy PF check for each RBG at this layer
-            # PF(u,m) = rate(u,m) / (avg_tp_before + eps), NOOP has PF=0
+            # 3) Off-policy DSACD reward (paper Appendix D.4, Eq.20-21)
+            # Use "past average throughput" snapshot from start-of-TTI as R_u.
+            # For this toy env, achievable rate does not depend on co-scheduled users,
+            # so T_{u,m,l} = rate(u,m) if u is scheduled at (m,l), else 0.
             rewards_m = torch.empty((self.n_rbg,), device=self.device)
+
             for m in range(self.n_rbg):
                 chosen = int(self._alloc[l, m].item())
-                v_m = self._greedy_indicator_v(m, chosen, avg_tp_before_tti)
-                r = (P * v_m) if (l == 0) else (self.k * v_m)
-                rewards_m[m] = r
+
+                # Raw rewards for all UE actions (exclude NOOP) for normalization.
+                # NOTE: This is a toy proxy: in a real MU-MIMO simulator, T_{u,m,l}
+                # would depend on the co-scheduled set and would be recomputed per candidate.
+                raw_all = torch.empty((self.n_ue,), device=self.device, dtype=torch.float32)
+                for u in range(self.n_ue):
+                    if self.buf[u] <= 0:
+                        raw_all[u] = 0.0
+                        continue
+
+                    Ru = float((avg_tp_before_tti[u] + self.eps).item())
+                    Tu = float(self._rate(u, m).item())
+
+                    if l == 0:
+                        raw_all[u] = Tu / Ru
+                    else:
+                        prev = int(self._alloc[l - 1, m].item())
+                        Tu_prev = Tu if (prev == u) else 0.0
+                        raw_all[u] = (Tu / Ru) - (Tu_prev / Ru)
+
+                max_raw = float(raw_all.max().item()) if raw_all.numel() > 0 else 0.0
+
+                if max_raw > 0.0:
+                    if chosen == self.noop:
+                        rewards_m[m] = 0.0
+                    else:
+                        u = int(chosen)
+                        # chosen might be invalid if buf==0; keep safe
+                        if u < 0 or u >= self.n_ue or self.buf[u] <= 0:
+                            rewards_m[m] = 0.0
+                        else:
+                            raw = float(raw_all[u].item())
+                            rewards_m[m] = max(raw / max_raw, -1.0)
+                elif max_raw < 0.0:
+                    # Rare in this toy env, but implement paper's special-case anyway.
+                    rewards_m[m] = 1.0 if (chosen == self.noop) else -1.0
+                else:
+                    # All-zero raw reward (e.g., no buffered UEs).
+                    rewards_m[m] = 0.0
 
             # 5) Apply service (drain buffers) for this layer after reward computation
             # Deterministically drain proportional to served rate (cap at available buf)
