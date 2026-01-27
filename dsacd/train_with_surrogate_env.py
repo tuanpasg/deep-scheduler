@@ -21,45 +21,51 @@ from DSACD_multibranch import (
 # Diagnostic: greedy match rate
 # -------------------------
 @torch.no_grad()
-def greedy_match_rate(env, actor, n_samples=5):
-    """
-    Measures how often the actor chooses PF-greedy actions.
-    Uses the env's own greedy definition (v_m).
-    """
-    matches = 0
-    total = 0
-
+def greedy_match_rate(env, actor, n_samples=3):
     dev = next(actor.parameters()).device
 
+    # ---- snapshot env state (minimal set for this toy env) ----
+    t0 = env.t
+    buf0 = env.buf.detach().clone()
+    avg0 = env.avg_tp.detach().clone()
+    alloc0 = env._alloc.detach().clone()
+
+    matches = 0
+    total = 0
+    valid_cnt_sum = 0
+
     for _ in range(n_samples):
+        # Use the SAME reference as reward uses: "before TTI"
+        avg_ref = env.avg_tp.detach().clone()
+
         env.begin_tti()
 
         for layer_ctx in env.layer_iter():
-            obs = layer_ctx.obs.unsqueeze(0).to(dev)   # [1, obs_dim]
-            masks = layer_ctx.masks_rbg.to(dev)        # [M, A]
+            obs = layer_ctx.obs.unsqueeze(0).to(dev)     # [1, obs_dim]
+            masks = layer_ctx.masks_rbg.to(dev)          # [M, A]
 
-            logits_all = actor.forward_all(obs).squeeze(0)      # [M, A]
+            logits_all = actor.forward_all(obs).squeeze(0)  # [M, A]
             logits_all = apply_action_mask_to_logits(logits_all, masks)
+            actions = torch.distributions.Categorical(logits=logits_all).sample()  # [M]
 
-            actions = torch.distributions.Categorical(
-                logits=logits_all
-            ).sample()                                         # [M]
-
-            # compare against greedy PF choice
             for m in range(env.n_rbg):
                 chosen = int(actions[m].item())
-                v_m = env._greedy_indicator_v(
-                    m,
-                    chosen,
-                    env.avg_tp
-                )
-                if v_m > 0:
-                    matches += 1
+                v_m = env._greedy_indicator_v(m, chosen, avg_ref)  # <- snapshot ref
+                matches += (v_m > 0)
                 total += 1
+                valid_cnt_sum += int(masks[m].sum().item())
 
-        env.end_tti()
+        # IMPORTANT: do NOT call env.end_tti() (it mutates buf/avg_tp a lot)
 
-    return matches / max(total, 1)
+    # ---- restore env state ----
+    env.t = t0
+    env.buf = buf0
+    env.avg_tp = avg0
+    env._alloc = alloc0
+
+    avg_valid = valid_cnt_sum / max(total, 1)
+    baseline = 1.0 / max(avg_valid, 1.0)
+    return float(matches) / max(total, 1), avg_valid, baseline
 
 # -------------------------
 # Minimal uniform replay
@@ -219,15 +225,15 @@ def main(args):
           msg = f"[TTI {tti}] Buffer={replay.size}"
 
           if replay.size >= args.learning_starts:
-              msg += (
-                  f" alpha={metrics['alpha']:.4f}"
-                  f" loss_q={metrics['loss_q']:.4f}"
-                  f" loss_pi={metrics['loss_pi']:.4f}"
-              )
+            msg += (
+                f" alpha={metrics['alpha']:.4f}"
+                f" loss_q={metrics['loss_q']:.4f}"
+                f" loss_pi={metrics['loss_pi']:.4f}"
+            )
 
-              # ---- ADD THIS LINE ----
-              gmr = greedy_match_rate(env, updater.actor, n_samples=3)
-              msg += f" greedy_match={gmr:.3f}"
+            # ---- ADD THIS LINE ----
+            gmr, avg_valid, base = greedy_match_rate(env, updater.actor, n_samples=3)
+            msg += f" greedy_match={gmr:.3f} avg_valid={avg_valid:.1f} rand≈{base:.3f}"
 
           print(msg)
 
@@ -241,7 +247,7 @@ if __name__ == "__main__":
     p.add_argument("--log_every", type=int, default=20)
 
     p.add_argument("--obs_dim", type=int, default=410)
-    p.add_argument("--act_dim", type=int, default=198)
+    p.add_argument("--act_dim", type=int, default=11)
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--n_rbg", type=int, default=18)
     p.add_argument("--fallback_action", type=int, default=0)
