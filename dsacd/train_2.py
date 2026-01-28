@@ -143,6 +143,100 @@ def evaluate_scheduler_metrics(
         "avg_layers_per_rbg": float(avg_layers_per_rbg),
     }
 
+@torch.no_grad()
+def evaluate_random_scheduler_metrics(
+    eval_env: DeterministicToy5GEnvAdapter,
+    *,
+    eval_ttis: int,
+    seed: int = 0,
+) -> dict:
+    """Random uniform-over-valid-actions baseline with the same metrics."""
+    g = torch.Generator(device="cpu").manual_seed(int(seed))
+
+    eval_env.reset()
+
+    U = eval_env.n_ue
+    M = eval_env.n_rbg
+    L = eval_env.n_layers
+    noop = eval_env.noop
+    eps = eval_env.eps
+
+    total_cell_tput = 0.0
+    total_ue_tput = torch.zeros((U,), dtype=torch.float32)
+    alloc_counts = torch.zeros((U,), dtype=torch.float32)
+
+    invalid = 0
+    nosched = 0
+    decisions = 0
+
+    layers_per_rbg_sum = 0.0
+    layers_per_rbg_den = 0
+
+    for _ in range(eval_ttis):
+        eval_env.begin_tti()
+
+        for layer_ctx in eval_env.layer_iter():
+            masks = layer_ctx.masks_rbg.cpu()  # [M, A]
+            actions = torch.empty((M,), dtype=torch.long)
+
+            for m in range(M):
+                valid_idx = torch.nonzero(masks[m], as_tuple=False).view(-1)
+                if valid_idx.numel() == 0:
+                    actions[m] = int(noop)
+                else:
+                    j = int(torch.randint(0, int(valid_idx.numel()), (1,), generator=g).item())
+                    actions[m] = int(valid_idx[j].item())
+
+                a = int(actions[m].item())
+                decisions += 1
+                if not bool(masks[m, a].item()):
+                    invalid += 1
+                if a == noop:
+                    nosched += 1
+
+            eval_env.apply_layer_actions(layer_ctx, actions)
+
+        alloc = eval_env._alloc.detach().cpu()  # [L, M]
+        ue_tti = torch.zeros((U,), dtype=torch.float32)
+
+        for m in range(M):
+            scheduled_layers = 0
+            for l in range(L):
+                u = int(alloc[l, m].item())
+                if u == noop:
+                    continue
+                scheduled_layers += 1
+                ue_tti[u] += float(eval_env._rate(u, m).detach().cpu().item())
+                alloc_counts[u] += 1.0
+
+            layers_per_rbg_sum += float(scheduled_layers)
+            layers_per_rbg_den += 1
+
+        total_ue_tput += ue_tti
+        total_cell_tput += float(ue_tti.sum().item())
+
+        eval_env.end_tti()
+
+    invalid_action_rate = invalid / max(decisions, 1)
+    no_schedule_rate = nosched / max(decisions, 1)
+    avg_layers_per_rbg = layers_per_rbg_sum / max(layers_per_rbg_den, 1)
+
+    jain_throughput = _jain_fairness(total_ue_tput)
+    pf_utility = float(torch.log((total_ue_tput / max(eval_ttis, 1)) + eps).sum().item())
+
+    return {
+        "mode": "random",
+        "eval_ttis": int(eval_ttis),
+        "total_cell_tput": float(total_cell_tput),
+        "total_ue_tput": total_ue_tput,
+        "alloc_counts": alloc_counts,
+        "jain_throughput": float(jain_throughput),
+        "pf_utility": float(pf_utility),
+        "invalid_action_rate": float(invalid_action_rate),
+        "no_schedule_rate": float(no_schedule_rate),
+        "avg_layers_per_rbg": float(avg_layers_per_rbg),
+    }
+
 # -------------------------
 # Minimal uniform replay
 # -------------------------
@@ -290,7 +384,16 @@ def main(args):
             "pf_utility": [],
             "avg_layers_per_rbg": [],
         },
+        "random": {
+            "tti": [],
+            "total_cell_tput": [],
+            "total_ue_tput": [],
+            "alloc_counts": [],
+            "pf_utility": [],
+            "avg_layers_per_rbg": [],
+        },
     }
+    
     train_log = {
         "tti": [],
         "alpha": [],
@@ -439,10 +542,17 @@ def main(args):
                 mode="greedy",
             )
 
+            # Compact summary: throughput + key sanity + pairing + fairness
+            m_rand = evaluate_random_scheduler_metrics(
+                eval_env,
+                eval_ttis=args.eval_ttis,
+                seed=args.seed + 999,
+            )
+
             _append_eval("sample", tti, m_sample)
             _append_eval("greedy", tti, m_greedy)
+            _append_eval("random",tti, m_rand)
 
-            # Compact summary: throughput + key sanity + pairing + fairness
             msg += (
                 f" | SAMPLE cell_tput={m_sample['total_cell_tput']:.2f}"
                 f" jain={m_sample['jain_throughput']:.3f}"
@@ -456,6 +566,12 @@ def main(args):
                 f" inv={m_greedy['invalid_action_rate']:.3f}"
                 f" noop={m_greedy['no_schedule_rate']:.3f}"
                 f" layers/RBG={m_greedy['avg_layers_per_rbg']:.2f}"
+                f" || RANDOM cell_tput={m_rand['total_cell_tput']:.2f}"
+                f" jain={m_rand['jain_throughput']:.3f}"
+                f" pfU={m_rand['pf_utility']:.2f}"
+                f" inv={m_rand['invalid_action_rate']:.3f}"
+                f" noop={m_rand['no_schedule_rate']:.3f}"
+                f" layers/RBG={m_rand['avg_layers_per_rbg']:.2f}"
             )
             print(msg)
 
@@ -467,6 +583,7 @@ def main(args):
 
     _plot_eval("sample", eval_log["sample"], os.path.join(args.out_dir, "performance_with_sampling.png"))
     _plot_eval("greedy", eval_log["greedy"], os.path.join(args.out_dir, "performance_with_greedy.png"))
+    _plot_eval("random", eval_log["random"], os.path.join(args.out_dir, "performance_with_random.png"))
     _plot_training(train_log, os.path.join(args.out_dir, "training_behavior.png"))
 
 if __name__ == "__main__":
