@@ -1,8 +1,11 @@
 import argparse
 import random
+import json
+import os
 from collections import deque
 
 import torch
+import matplotlib.pyplot as plt
 
 from toy5g_env_adapter import DeterministicToy5GEnvAdapter
 
@@ -270,6 +273,116 @@ def main(args):
 
     env.reset()
 
+    eval_log = {
+        "sample": {
+            "tti": [],
+            "total_cell_tput": [],
+            "total_ue_tput": [],
+            "alloc_counts": [],
+            "pf_utility": [],
+            "avg_layers_per_rbg": [],
+        },
+        "greedy": {
+            "tti": [],
+            "total_cell_tput": [],
+            "total_ue_tput": [],
+            "alloc_counts": [],
+            "pf_utility": [],
+            "avg_layers_per_rbg": [],
+        },
+    }
+    train_log = {
+        "tti": [],
+        "alpha": [],
+        "loss_q": [],
+        "loss_pi": [],
+    }
+
+    def _append_eval(mode: str, tti: int, m: dict):
+        log = eval_log[mode]
+        log["tti"].append(int(tti))
+        log["total_cell_tput"].append(float(m["total_cell_tput"]))
+        log["total_ue_tput"].append([float(x) for x in m["total_ue_tput"].tolist()])
+        log["alloc_counts"].append([float(x) for x in m["alloc_counts"].tolist()])
+        log["pf_utility"].append(float(m["pf_utility"]))
+        log["avg_layers_per_rbg"].append(float(m["avg_layers_per_rbg"]))
+
+    def _plot_eval(mode: str, log: dict, out_path: str):
+        if not log["tti"]:
+            return
+        t = log["tti"]
+
+        fig, axs = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+
+        # total_cell_tput + total_ue_tput (per-UE) in the same subplot
+        ax = axs[0, 0]
+        ax.plot(t, log["total_cell_tput"], label="total_cell_tput", linewidth=2)
+        ue_tput = log["total_ue_tput"]
+        if ue_tput:
+            n_ue = len(ue_tput[0])
+            for u in range(n_ue):
+                series = [row[u] for row in ue_tput]
+                ax.plot(t, series, label=f"ue{u}_tput", alpha=0.6)
+        ax.set_title("Cell + UE throughput")
+        ax.set_xlabel("TTI")
+        ax.set_ylabel("Throughput")
+        ax.legend(loc="best", fontsize=8, ncol=2)
+
+        # alloc_counts
+        ax = axs[0, 1]
+        alloc = log["alloc_counts"]
+        if alloc:
+            n_ue = len(alloc[0])
+            for u in range(n_ue):
+                series = [row[u] for row in alloc]
+                ax.plot(t, series, label=f"ue{u}_alloc", alpha=0.7)
+        ax.set_title("Alloc counts")
+        ax.set_xlabel("TTI")
+        ax.set_ylabel("Count")
+        ax.legend(loc="best", fontsize=8, ncol=2)
+
+        # pf_utility
+        ax = axs[1, 0]
+        ax.plot(t, log["pf_utility"], label="pf_utility", linewidth=2)
+        ax.set_title("PF utility")
+        ax.set_xlabel("TTI")
+        ax.set_ylabel("Utility")
+
+        # avg_layers_per_rbg
+        ax = axs[1, 1]
+        ax.plot(t, log["avg_layers_per_rbg"], label="avg_layers_per_rbg", linewidth=2)
+        ax.set_title("Avg layers per RBG")
+        ax.set_xlabel("TTI")
+        ax.set_ylabel("Layers/RBG")
+
+        fig.suptitle(f"Performance with {mode}")
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+
+    def _plot_training(log: dict, out_path: str):
+        if not log["tti"]:
+            return
+        t = log["tti"]
+        fig, axs = plt.subplots(3, 1, figsize=(10, 9), constrained_layout=True)
+        axs[0].plot(t, log["alpha"], label="alpha", linewidth=2)
+        axs[0].set_title("Alpha")
+        axs[0].set_xlabel("TTI")
+        axs[0].set_ylabel("Value")
+
+        axs[1].plot(t, log["loss_q"], label="loss_q", linewidth=2)
+        axs[1].set_title("Loss Q")
+        axs[1].set_xlabel("TTI")
+        axs[1].set_ylabel("Value")
+
+        axs[2].plot(t, log["loss_pi"], label="loss_pi", linewidth=2)
+        axs[2].set_title("Loss Pi")
+        axs[2].set_xlabel("TTI")
+        axs[2].set_ylabel("Value")
+
+        fig.suptitle("Training behavior")
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+
     for tti in range(args.ttis):
         env.begin_tti()
 
@@ -304,6 +417,10 @@ def main(args):
                     f" loss_q={metrics['loss_q']:.4f}"
                     f" loss_pi={metrics['loss_pi']:.4f}"
                 )
+                train_log["tti"].append(int(tti))
+                train_log["alpha"].append(float(metrics["alpha"]))
+                train_log["loss_q"].append(float(metrics["loss_q"]))
+                train_log["loss_pi"].append(float(metrics["loss_pi"]))
 
             print(msg)
 
@@ -322,6 +439,9 @@ def main(args):
                 mode="greedy",
             )
 
+            _append_eval("sample", tti, m_sample)
+            _append_eval("greedy", tti, m_greedy)
+
             # Compact summary: throughput + key sanity + pairing + fairness
             msg += (
                 f" | SAMPLE cell_tput={m_sample['total_cell_tput']:.2f}"
@@ -338,6 +458,16 @@ def main(args):
                 f" layers/RBG={m_greedy['avg_layers_per_rbg']:.2f}"
             )
             print(msg)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    with open(os.path.join(args.out_dir, "eval_log.json"), "w", encoding="utf-8") as f:
+        json.dump(eval_log, f, indent=2)
+    with open(os.path.join(args.out_dir, "train_log.json"), "w", encoding="utf-8") as f:
+        json.dump(train_log, f, indent=2)
+
+    _plot_eval("sample", eval_log["sample"], os.path.join(args.out_dir, "performance_with_sampling.png"))
+    _plot_eval("greedy", eval_log["greedy"], os.path.join(args.out_dir, "performance_with_greedy.png"))
+    _plot_training(train_log, os.path.join(args.out_dir, "training_behavior.png"))
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -369,6 +499,7 @@ if __name__ == "__main__":
 
     p.add_argument("--eval_every", type=int, default=50)
     p.add_argument("--eval_ttis", type=int, default=50)
+    p.add_argument("--out_dir", type=str, default=os.path.join("outputs", "train_2"))
 
     args = p.parse_args()
     main(args)
