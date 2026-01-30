@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterator, List, Dict, Optional
 import math
 import torch
+import numpy as np
 
 
 @dataclass
@@ -62,6 +63,7 @@ class DeterministicToy5GEnvAdapter:
         self.n_rbg = n_rbg
         self.device = torch.device(device)
 
+        self.max_mcs = 28  # max MCS index (0..28)
         self.k = float(k)
         self.gmax = float(gmax)
         self.ema_beta = float(ema_beta)
@@ -91,6 +93,11 @@ class DeterministicToy5GEnvAdapter:
         self._alloc = torch.full((self.n_layers, self.n_rbg), self.noop, device=self.device, dtype=torch.long)
         self._last_transitions: List[Dict] = []
         self._cur_layer: Optional[int] = None
+
+        # Fadding profile: set fixed mcs values randomly for candidate UEs, this mcs value is constant through both layers and rb groups
+        rng = np.random.default_rng()
+        self.mcs_mean = rng.integers(0, self.mcs_max+1, size=(1,self.n_ue))
+        self.mcs_spread = 0
 
     # ---------- Public API ----------
     def reset(self):
@@ -248,7 +255,43 @@ class DeterministicToy5GEnvAdapter:
     def _build_obs(self, layer: int) -> torch.Tensor:
         # Build structured features then pad/truncate to obs_dim.
         # Keep deterministic and "5G-ish": UE features + summary of channels.
-        # UE features: [avg_tp, buf] per UE
+        # Build structured features then pad/truncate to obs_dim.
+        # Per-UE features (7 total; last two reserved):
+        # 1. Normalized Past Averaged Throughput [1]: avg_tp_u / max(avg_tp)
+        # 2. Normalized Rank of UE [1]: rank_u / (U-1) where rank 0 is best avg_tp
+        # 3. Normalized Number of Already Allocated RBGs [1] (layers < current)
+        # 4. Normalized Downlink Buffer Status [1]: buf_u / max(buf)
+        # 5. Normalized Wideband (CQI->MCS) [1]: mcs_u / 28
+        # 6. Reserved (0)
+        # 7. Reserved (0)
+
+        # 1. 
+        mcs = self._curr_mcs.copy()
+
+        served = np.zeros(4, dtype=float) # [Served bytes in a TTI]
+        for i in range(self.n_ue):
+            tbs = tbs_38214_bytes(int(mcs[i]), int(prbs_out[i]), n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
+            s = min(self.backlog[i], tbs)
+            served[i] = s
+            self.backlog[i] -= s
+        
+        duration_s = self.tti_ms / 1000.0
+        thr_inst_mbps = (served * 8.0) / 1e6 / max(duration_s, 1e-9) # Instantaneous rate per UE [Megabits per second]
+        self.thr_ema_mbps = self.rho * self.thr_ema_mbps + (1.0 - self.rho) * thr_inst_mbps # Long-term rate [Megabits per second]
+        norm_past_avg_tp = self.thr_ema_mbps/self.max_tp
+
+        # 2. Normalized Rank of UE [1]
+        norm_ue_rank = self.ue_rank/self.max_ue_rank
+
+        # 3. Normalized Number of Already Allocated RBGs: Acumulate the number of rbg a ue has been assigned from the first layer, then normalize it with n_rbg
+    
+        # 4 . Normalized Downlink Buffer Status
+        norm_allocated_rbgs =  np.clip(self.backlog / self.load_capability, 0.0, 1.0)
+
+        # 5. Normalized Wideband CQI will be merged to mcs
+        self._curr_mcs = self._sample_mcs()
+        norm_wb_cqi = self._curr_mcs/self.max_mcs
+
         ue_feat = torch.stack([self.avg_tp, self.buf], dim=1).reshape(-1)  # [2U]
         # RBG summary: mean SNR per RBG across UEs (frequency selectivity hint)
         rbg_snr_mean = self.snr.mean(dim=0)  # [M]
@@ -263,25 +306,11 @@ class DeterministicToy5GEnvAdapter:
         out[: core.numel()] = core
         return out
 
-    def _geom_mean(self, x: torch.Tensor) -> float:
-        # geometric mean exp(mean(log(x)))
-        return float(torch.exp(torch.mean(torch.log(x))).item())
-
-    def _pf(self, ue: int, m: int, avg_tp_ref: torch.Tensor) -> float:
-        if ue == self.noop:
-            return 0.0
-        if self.buf[ue] <= 0:
-            return -1e9
-        rate = float(self._rate(ue, m).item())
-        denom = float((avg_tp_ref[ue] + self.eps).item())
-        return rate / denom
-
-    def _greedy_indicator_v(self, m: int, chosen: int, avg_tp_ref: torch.Tensor) -> float:
-        chosen_pf = self._pf(chosen, m, avg_tp_ref)
-        best_pf = chosen_pf
-        # greedy search over all valid UEs + NOOP
-        for ue in range(self.act_dim):
-            pf = self._pf(ue, m, avg_tp_ref)
-            if pf > best_pf:
-                best_pf = pf
-        return -1.0 if (best_pf > chosen_pf + 1e-12) else 1.0
+    def _sample_mcs(self):
+        if self.mcs_spread == 0:
+            mcs = self.mcs_mean.copy()
+        else:
+            jitter = self.rng.integers(-self.mcs_spread, self.mcs_spread + 1, size=4)
+            mcs = np.clip(self.mcs_mean + jitter, 0, 28)
+        self._curr_mcs = mcs.astype(int)
+        return self._curr_mcs

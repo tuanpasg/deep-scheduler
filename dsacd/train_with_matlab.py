@@ -370,6 +370,9 @@ def main(args):
     train_log = init_train_log()
 
     for tti in range(args.ttis):
+        # Sending Observation Request to MATLAB for a new TTI
+        # Waiting for Observation Response
+        # Initialize the python environment handler with received observation
         env.begin_tti()
 
         for layer_ctx in env.layer_iter():
@@ -380,11 +383,16 @@ def main(args):
                 device=device,
                 fallback_action=args.fallback_action,
             )
+
+            # Adding layer action to tti action buffer
+
+            # Update observation for the following layer
             env.apply_layer_actions(layer_ctx, actions_rbg)
 
         env.end_tti()
         transitions = env.export_branch_transitions()
 
+        # Adding experience to replay buffer
         for tr in transitions:
             replay.add(tr)
 
@@ -392,7 +400,7 @@ def main(args):
             batch = replay.sample(args.batch_size, device=device)
             metrics = updater.update(batch=batch, isw=None)
 
-        # print("actor_delta_l2:", actor_param_delta())
+        # Sending tti action buffer to MATLAB
 
         if tti % args.log_every == 0:
             msg = f"[TTI {tti}] Buffer={replay.size}"
