@@ -81,8 +81,9 @@ def evaluate_pf_match(eval_env, actor, *, n_eval_ttis=50, tol=1e-9):
 
             # Advance env using the actor actions (so eval state distribution is realistic)
             eval_env.apply_layer_actions(layer_ctx, actions.cpu())
+            eval_env.compute_layer_transitions(layer_ctx)
 
-        eval_env.end_tti()
+        eval_env.finish_tti()
 
     pf_match = matches / max(total, 1)
     avg_valid = valid_sum / max(total, 1)
@@ -281,12 +282,11 @@ def main(args):
                 fallback_action=args.fallback_action,
             )
             env.apply_layer_actions(layer_ctx, actions_rbg)
+            transitions = env.compute_layer_transitions(layer_ctx)
+            for tr in transitions:
+                replay.add(tr)
 
-        env.end_tti()
-        transitions = env.export_branch_transitions()
-
-        for tr in transitions:
-            replay.add(tr)
+        env.finish_tti()
 
         if replay.size >= args.learning_starts:
             batch = replay.sample(args.batch_size, device=device)

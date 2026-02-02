@@ -1,10 +1,41 @@
 # toy5g_env_adapter.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Iterator, List, Dict, Optional
+from typing import Iterator, List, Dict, Optional, Tuple
 import math
 import torch
 import numpy as np
+
+
+# ----------------------
+# 38.214-inspired helpers
+# ----------------------
+MCS_TABLE: List[Tuple[int, int]] = [
+    (2, 120), (2, 157), (2, 193), (2, 251), (2, 308), (2, 379),
+    (4, 449), (4, 526), (4, 602), (4, 679), (6, 340), (6, 378),
+    (6, 434), (6, 490), (6, 553), (6, 616), (6, 658), (8, 438),
+    (8, 466), (8, 517), (8, 567), (8, 616), (8, 666), (8, 719),
+    (8, 772), (8, 822), (8, 873), (8, 910), (8, 948),
+]
+
+
+def tbs_38214_bytes(mcs_idx, n_prb, n_symb=14, n_layers=1, overhead_re_per_prb=18):
+    """Very light TBS proxy (bytes)."""
+    if n_prb <= 0 or mcs_idx < 0:
+        return 0
+    mcs_idx = int(max(0, min(28, mcs_idx)))
+    Qm, R1024 = MCS_TABLE[mcs_idx]
+    R = R1024 / 1024.0
+    N_re_per_prb = max(0, 12 * n_symb - overhead_re_per_prb)
+    Ninfo = R * Qm * N_re_per_prb * int(n_prb) * n_layers
+    if Ninfo <= 0:
+        return 0
+    if Ninfo <= 3824:
+        TBS_bits = int(6 * math.ceil(Ninfo / 6.0))
+    else:
+        TBS_bits = int(6 * math.ceil((Ninfo - 24) / 6.0))
+    TBS_bits = max(TBS_bits, 24)
+    return TBS_bits // 8
 
 
 @dataclass
@@ -43,16 +74,17 @@ class DeterministicToy5GEnvAdapter:
         *,
         seed: int = 0,
         device: str = "cpu",
-        # reward params
-        k: float = 0.2,
-        gmax: float = 1.0,
         # PF/throughput params
         ema_beta: float = 0.98,
         eps: float = 1e-6,
         # deterministic traffic/channel knobs
         base_rate: float = 1.0,
-        buf_init: int = 50,
-        buf_arrival: int = 10,
+        buf_init: int = 50_000,
+        buf_arrival: int = 10_000,
+        tti_ms: float = 1.0,
+        prbs_per_rbg: int = 18,
+        n_symb: int = 14,
+        overhead_re_per_prb: int = 18,
     ):
         assert act_dim >= 2, "Need at least 1 UE + NOOP."
         self.obs_dim = obs_dim
@@ -64,40 +96,42 @@ class DeterministicToy5GEnvAdapter:
         self.device = torch.device(device)
 
         self.max_mcs = 28  # max MCS index (0..28)
-        self.k = float(k)
-        self.gmax = float(gmax)
+        self.max_ue_rank = 2
         self.ema_beta = float(ema_beta)
         self.eps = float(eps)
         self.base_rate = float(base_rate)
         self.buf_init = int(buf_init)
         self.buf_arrival = int(buf_arrival)
+        self.tti_ms = float(tti_ms)
+        self.prbs_per_rbg = int(prbs_per_rbg)
+        self.n_symb = int(n_symb)
+        self.overhead = int(overhead_re_per_prb)
+        self.max_rate = 1100 # [Mbps] 4 Layers x 273 RB x QAM64 x 1 TTI [1ms]
 
         g = torch.Generator(device="cpu")
         g.manual_seed(seed)
         self._gen = g
 
-        # Deterministic channel quality matrix (UE x RBG), fixed for whole run
-        # Keep it deterministic but not uniform.
-        # Convert to "SNR-like" positive values.
-        u = torch.arange(self.n_ue).float().unsqueeze(1)
-        m = torch.arange(self.n_rbg).float().unsqueeze(0)
-        self.snr = (1.0 + 0.2 * torch.sin(0.7 * u + 0.3 * m) + 0.1 * torch.cos(0.2 * u - 0.5 * m)).clamp_min(0.05)
-        self.snr = self.snr.to(self.device)  # [U, M]
-
         # State
         self.t = 0
-        self.buf = torch.full((self.n_ue,), self.buf_init, device=self.device, dtype=torch.float32)  # "packets"
-        self.avg_tp = torch.full((self.n_ue,), 1.0, device=self.device, dtype=torch.float32)          # EMA throughput
+        self.buf = torch.full((self.n_ue,), self.buf_init, device=self.device, dtype=torch.float32)  # bytes
+        self.avg_tp = torch.full((self.n_ue,), 1.0, device=self.device, dtype=torch.float32)          # EMA throughput (Mbps)
 
         # Allocation caches (per TTI)
         self._alloc = torch.full((self.n_layers, self.n_rbg), self.noop, device=self.device, dtype=torch.long)
         self._last_transitions: List[Dict] = []
         self._cur_layer: Optional[int] = None
+        self._arrivals_added = False
+        self._avg_tp_before_tti: Optional[torch.Tensor] = None
 
-        # Fadding profile: set fixed mcs values randomly for candidate UEs, this mcs value is constant through both layers and rb groups
-        rng = np.random.default_rng()
-        self.mcs_mean = rng.integers(0, self.mcs_max+1, size=(1,self.n_ue))
+        # Per-UE rank capability (spatial layers supported), max rank = 2
+        self.ue_rank = (1 + (torch.arange(self.n_ue) % 2)).to(self.device).float()
+
+        # Fading profile: fixed per-UE MCS mean (constant through layers/RBGs)
+        self.rng = np.random.default_rng(seed)
+        self.mcs_mean = self.rng.integers(0, self.max_mcs + 1, size=(self.n_ue,))
         self.mcs_spread = 0
+        self._sample_mcs()
 
     # ---------- Public API ----------
     def reset(self):
@@ -107,11 +141,15 @@ class DeterministicToy5GEnvAdapter:
         self._alloc.fill_(self.noop)
         self._last_transitions = []
         self._cur_layer = None
+        self._arrivals_added = False
+        self._avg_tp_before_tti = None
 
     def begin_tti(self):
         self._alloc.fill_(self.noop)
         self._last_transitions = []
         self._cur_layer = None
+        self._arrivals_added = False
+        self._avg_tp_before_tti = None
 
     def layer_iter(self) -> Iterator[LayerContext]:
         # We yield layer contexts one by one; obs is global state + layer id encoding.
@@ -129,121 +167,33 @@ class DeterministicToy5GEnvAdapter:
         a = actions_rbg.to(self.device).long().clamp(0, self.act_dim - 1)
         self._alloc[l, :] = a
 
-    def end_tti(self):
-        """
-        After all layers have been applied, we compute rewards for each layer sequentially,
-        storing transitions (s, a, r, s') per (layer, rbg) branch with masks.
-        """
-        # deterministically add arrivals at start of TTI reward computation
-        self.buf = self.buf + self.buf_arrival
-
-        # Pre-compute masks/obs for each layer (s), and next layer (s') as "after reward"
-        # We compute reward layer-by-layer (as paper), updating avg_tp each layer using partial throughput.
-        # For deterministic toy, we treat each layer contribution as additive throughput on each RBG.
-        avg_tp_before_tti = self.avg_tp.clone()
-
-        # For each layer l: compute partial throughput with layers 0..l included
-        for l in range(self.n_layers):
-            masks = self._build_masks()  # based on current buffers (after arrivals, before serving)
-            obs = self._build_obs(layer=l)
-
-            # reward computed after finishing layer l allocation (across all RBGs)
-            # 1) compute instantaneous per-UE throughput for *this layer only* and accumulate
-            tp_layer = torch.zeros((self.n_ue,), device=self.device)
-            for m in range(self.n_rbg):
-                ue = int(self._alloc[l, m].item())
-                if ue == self.noop:
-                    continue
-                if self.buf[ue] <= 0:
-                    continue  # should be masked but keep safe
-                tp_layer[ue] += self._rate(ue, m)
-
-            # 2) update EMA throughput using this layer contribution (paper says reward after each layer iteration)
-            self.avg_tp = self.ema_beta * self.avg_tp + (1.0 - self.ema_beta) * tp_layer
-
-            # 3) Off-policy DSACD reward (paper Appendix D.4, Eq.20-21)
-            # Use "past average throughput" snapshot from start-of-TTI as R_u.
-            # For this toy env, achievable rate does not depend on co-scheduled users,
-            # so T_{u,m,l} = rate(u,m) if u is scheduled at (m,l), else 0.
-            rewards_m = torch.empty((self.n_rbg,), device=self.device)
-
-            for m in range(self.n_rbg):
-                chosen = int(self._alloc[l, m].item())
-
-                # Raw rewards for all UE actions (exclude NOOP) for normalization.
-                # NOTE: This is a toy proxy: in a real MU-MIMO simulator, T_{u,m,l}
-                # would depend on the co-scheduled set and would be recomputed per candidate.
-                raw_all = torch.empty((self.n_ue,), device=self.device, dtype=torch.float32)
-                for u in range(self.n_ue):
-                    if self.buf[u] <= 0:
-                        raw_all[u] = 0.0
-                        continue
-
-                    Ru = float((avg_tp_before_tti[u] + self.eps).item())
-                    Tu = float(self._rate(u, m).item())
-
-                    if l == 0:
-                        raw_all[u] = Tu / Ru
-                    else:
-                        prev = int(self._alloc[l - 1, m].item())
-                        Tu_prev = Tu if (prev == u) else 0.0
-                        raw_all[u] = (Tu / Ru) - (Tu_prev / Ru)
-
-                max_raw = float(raw_all.max().item()) if raw_all.numel() > 0 else 0.0
-
-                if max_raw > 0.0:
-                    if chosen == self.noop:
-                        rewards_m[m] = 0.0
-                    else:
-                        u = int(chosen)
-                        # chosen might be invalid if buf==0; keep safe
-                        if u < 0 or u >= self.n_ue or self.buf[u] <= 0:
-                            rewards_m[m] = 0.0
-                        else:
-                            raw = float(raw_all[u].item())
-                            rewards_m[m] = max(raw / max_raw, -1.0)
-                elif max_raw < 0.0:
-                    # Rare in this toy env, but implement paper's special-case anyway.
-                    rewards_m[m] = 1.0 if (chosen == self.noop) else -1.0
-                else:
-                    # All-zero raw reward (e.g., no buffered UEs).
-                    rewards_m[m] = 0.0
-
-            # 5) Apply service (drain buffers) for this layer after reward computation
-            # Deterministically drain proportional to served rate (cap at available buf)
-            for m in range(self.n_rbg):
-                ue = int(self._alloc[l, m].item())
-                if ue == self.noop:
-                    continue
-                served = self._rate(ue, m)  # "packets"
-                self.buf[ue] = torch.clamp(self.buf[ue] - served, min=0.0)
-
-            # next state after this layer
-            next_masks = self._build_masks()
-            next_obs = self._build_obs(layer=min(l + 1, self.n_layers - 1))
-
-            # Export transitions per RBG
-            for m in range(self.n_rbg):
-                self._last_transitions.append({
-                    "observation": obs.detach().cpu(),
-                    "next_observation": next_obs.detach().cpu(),
-                    "rbg_index": torch.tensor(m, dtype=torch.long),
-                    "action": torch.tensor(int(self._alloc[l, m].item()), dtype=torch.long),
-                    "reward": torch.tensor(float(rewards_m[m].item()), dtype=torch.float32),
-                    "action_mask": masks[m].detach().cpu(),           # [A] bool
-                    "next_action_mask": next_masks[m].detach().cpu(), # [A] bool
-                })
-
-        self.t += 1
-
     def export_branch_transitions(self) -> List[Dict]:
         return self._last_transitions
 
+    def compute_layer_transitions(self, layer_ctx: LayerContext) -> List[Dict]:
+        """Compute rewards and package transitions for a single layer using cached obs/masks."""
+        self._ensure_tti_start()
+        return self._compute_layer_transitions(
+            layer=layer_ctx.layer,
+            obs=layer_ctx.obs,
+            masks=layer_ctx.masks_rbg,
+        )
+
+    def finish_tti(self):
+        self.t += 1
+
     # ---------- Internals ----------
-    def _rate(self, ue: int, m: int) -> torch.Tensor:
-        # Deterministic "rate": base_rate * log2(1+snr)
-        snr = self.snr[ue, m]
-        return self.base_rate * torch.log2(1.0 + snr)
+    def _served_bytes(self, ue: int) -> torch.Tensor:
+        if not hasattr(self, "_curr_mcs"):
+            self._sample_mcs()
+        mcs = int(self._curr_mcs[ue])
+        tbs = tbs_38214_bytes(mcs, self.prbs_per_rbg, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
+        return torch.tensor(float(tbs), device=self.device)
+
+    def _rate_mbps(self, ue: int) -> torch.Tensor:
+        served = self._served_bytes(ue)
+        duration_s = self.tti_ms / 1000.0
+        return (served * 8.0) / 1e6 / max(duration_s, 1e-9)
 
     def _build_masks(self) -> torch.Tensor:
         # valid UE if buffer > 0, NOOP always valid
@@ -254,51 +204,43 @@ class DeterministicToy5GEnvAdapter:
 
     def _build_obs(self, layer: int) -> torch.Tensor:
         # Build structured features then pad/truncate to obs_dim.
-        # Keep deterministic and "5G-ish": UE features + summary of channels.
-        # Build structured features then pad/truncate to obs_dim.
         # Per-UE features (7 total; last two reserved):
         # 1. Normalized Past Averaged Throughput [1]: avg_tp_u / max(avg_tp)
-        # 2. Normalized Rank of UE [1]: rank_u / (U-1) where rank 0 is best avg_tp
+        # 2. Normalized Rank of UE [1]: rank_u / max_ue_rank
         # 3. Normalized Number of Already Allocated RBGs [1] (layers < current)
         # 4. Normalized Downlink Buffer Status [1]: buf_u / max(buf)
         # 5. Normalized Wideband (CQI->MCS) [1]: mcs_u / 28
         # 6. Reserved (0)
         # 7. Reserved (0)
-
-        # 1. 
-        mcs = self._curr_mcs.copy()
-
-        served = np.zeros(4, dtype=float) # [Served bytes in a TTI]
-        for i in range(self.n_ue):
-            tbs = tbs_38214_bytes(int(mcs[i]), int(prbs_out[i]), n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
-            s = min(self.backlog[i], tbs)
-            served[i] = s
-            self.backlog[i] -= s
         
-        duration_s = self.tti_ms / 1000.0
-        thr_inst_mbps = (served * 8.0) / 1e6 / max(duration_s, 1e-9) # Instantaneous rate per UE [Megabits per second]
-        self.thr_ema_mbps = self.rho * self.thr_ema_mbps + (1.0 - self.rho) * thr_inst_mbps # Long-term rate [Megabits per second]
-        norm_past_avg_tp = self.thr_ema_mbps/self.max_tp
+        norm_past_avg_tp = self.avg_tp / self.max_rate
 
-        # 2. Normalized Rank of UE [1]
-        norm_ue_rank = self.ue_rank/self.max_ue_rank
+        norm_ue_rank = torch.clamp(self.ue_rank / float(self.max_ue_rank), 0.0, 1.0)
 
-        # 3. Normalized Number of Already Allocated RBGs: Acumulate the number of rbg a ue has been assigned from the first layer, then normalize it with n_rbg
-    
-        # 4 . Normalized Downlink Buffer Status
-        norm_allocated_rbgs =  np.clip(self.backlog / self.load_capability, 0.0, 1.0)
+        if layer > 0:
+            prev_alloc = self._alloc[:layer, :]  # [L', M]
+            alloc_counts = torch.zeros((self.n_ue,), device=self.device, dtype=torch.float32)
+            for u in range(self.n_ue):
+                alloc_counts[u] = (prev_alloc == u).sum()
+            norm_allocated_rbgs = alloc_counts / float(max(self.n_rbg, 1))
+        else:
+            norm_allocated_rbgs = torch.zeros((self.n_ue,), device=self.device, dtype=torch.float32)
 
-        # 5. Normalized Wideband CQI will be merged to mcs
-        self._curr_mcs = self._sample_mcs()
-        norm_wb_cqi = self._curr_mcs/self.max_mcs
+        max_buf = torch.clamp(self.buf.max(), min=self.eps)
+        norm_buffer = self.buf / max_buf
 
-        ue_feat = torch.stack([self.avg_tp, self.buf], dim=1).reshape(-1)  # [2U]
-        # RBG summary: mean SNR per RBG across UEs (frequency selectivity hint)
-        rbg_snr_mean = self.snr.mean(dim=0)  # [M]
-        # Layer one-hot (L)
-        layer_oh = torch.zeros((self.n_layers,), device=self.device)
-        layer_oh[layer] = 1.0
-        core = torch.cat([ue_feat, rbg_snr_mean, layer_oh], dim=0).float()
+        if not hasattr(self, "_curr_mcs"):
+            self._sample_mcs()
+        mcs = torch.tensor(self._curr_mcs, device=self.device, dtype=torch.float32)
+        norm_wb_cqi = torch.clamp(mcs / float(self.max_mcs), 0.0, 1.0)
+
+        reserved = torch.zeros((self.n_ue, 2), device=self.device, dtype=torch.float32)
+        ue_feats = torch.stack(
+            [norm_past_avg_tp, norm_ue_rank, norm_allocated_rbgs, norm_buffer, norm_wb_cqi],
+            dim=1,
+        )
+        ue_feats = torch.cat([ue_feats, reserved], dim=1)  # [U, 7]
+        core = ue_feats.reshape(-1).float()
 
         if core.numel() >= self.obs_dim:
             return core[: self.obs_dim].clone()
@@ -310,7 +252,124 @@ class DeterministicToy5GEnvAdapter:
         if self.mcs_spread == 0:
             mcs = self.mcs_mean.copy()
         else:
-            jitter = self.rng.integers(-self.mcs_spread, self.mcs_spread + 1, size=4)
-            mcs = np.clip(self.mcs_mean + jitter, 0, 28)
-        self._curr_mcs = mcs.astype(int)
+            jitter = self.rng.integers(-self.mcs_spread, self.mcs_spread + 1, size=self.n_ue)
+            mcs = np.clip(self.mcs_mean + jitter, 0, self.max_mcs)
+        self._curr_mcs = np.asarray(mcs, dtype=int)
         return self._curr_mcs
+
+    def _ensure_tti_start(self):
+        if not self._arrivals_added:
+            self.buf = self.buf + self.buf_arrival
+            self._avg_tp_before_tti = self.avg_tp.clone()
+            self._arrivals_added = True
+
+    def _compute_layer_transitions(self, layer: int, obs: torch.Tensor, masks: torch.Tensor) -> List[Dict]:
+        # reward computed after finishing layer allocation (across all RBGs)
+        # 1) compute instantaneous per-UE throughput for *this layer only* and accumulate
+        #    Use actually served amount (cap by remaining buffer).
+        tp_layer = torch.zeros((self.n_ue,), device=self.device)
+        served_layer = torch.zeros((self.n_ue,), device=self.device)
+        served_rbg = torch.zeros((self.n_rbg,), device=self.device)
+        buf_tmp = self.buf.clone()
+        for m in range(self.n_rbg):
+            ue = int(self._alloc[layer, m].item())
+            if ue == self.noop:
+                continue
+            if buf_tmp[ue] <= 0:
+                continue  # should be masked but keep safe
+            served = self._served_bytes(ue)
+            served = torch.minimum(buf_tmp[ue], served)
+            served_rbg[m] = served
+            buf_tmp[ue] = torch.clamp(buf_tmp[ue] - served, min=0.0)
+            served_layer[ue] += served
+
+        duration_s = self.tti_ms / 1000.0
+        tp_layer = (served_layer * 8.0) / 1e6 / max(duration_s, 1e-9)
+
+        # 2) update EMA throughput using this layer contribution (paper says reward after each layer iteration)
+        self.avg_tp = self.ema_beta * self.avg_tp + (1.0 - self.ema_beta) * tp_layer
+
+        # 3) Off-policy DSACD reward (paper Appendix D.4, Eq.20-21)
+        avg_tp_before_tti = self._avg_tp_before_tti if self._avg_tp_before_tti is not None else self.avg_tp
+        rewards_m = torch.empty((self.n_rbg,), device=self.device)
+
+        for m in range(self.n_rbg):
+            chosen = int(self._alloc[layer, m].item())
+
+            raw_all = torch.empty((self.n_ue,), device=self.device, dtype=torch.float32)
+            for u in range(self.n_ue):
+                if self.buf[u] <= 0:
+                    raw_all[u] = 0.0
+                    continue
+
+                Ru = float((avg_tp_before_tti[u] + self.eps).item())
+                Tu = float(self._rate_mbps(u).item())
+
+                if layer == 0:
+                    raw_all[u] = Tu / Ru
+                else:
+                    prev = int(self._alloc[layer - 1, m].item())
+                    Tu_prev = Tu if (prev == u) else 0.0
+                    raw_all[u] = (Tu / Ru) - (Tu_prev / Ru)
+
+            max_raw = float(raw_all.max().item()) if raw_all.numel() > 0 else 0.0
+
+            if max_raw > 0.0:
+                if chosen == self.noop:
+                    rewards_m[m] = 0.0
+                else:
+                    u = int(chosen)
+                    # chosen might be invalid if buf==0; keep safe
+                    if u < 0 or u >= self.n_ue or self.buf[u] <= 0:
+                        rewards_m[m] = 0.0
+                    else:
+                        raw = float(raw_all[u].item())
+                        rewards_m[m] = max(raw / max_raw, -1.0)
+            elif max_raw < 0.0:
+                rewards_m[m] = 1.0 if (chosen == self.noop) else -1.0
+            else:
+                rewards_m[m] = 0.0
+
+        # 5) Apply service (drain buffers) for this layer after reward computation
+        for m in range(self.n_rbg):
+            ue = int(self._alloc[layer, m].item())
+            if ue == self.noop:
+                continue
+            served = served_rbg[m]
+            self.buf[ue] = torch.clamp(self.buf[ue] - served, min=0.0)
+
+        # next state after this layer
+        next_masks = self._build_masks()
+        next_obs = self._build_obs(layer=min(layer + 1, self.n_layers - 1))
+
+        out = []
+        for m in range(self.n_rbg):
+            out.append({
+                "observation": obs.detach().cpu(),
+                "next_observation": next_obs.detach().cpu(),
+                "rbg_index": torch.tensor(m, dtype=torch.long),
+                "action": torch.tensor(int(self._alloc[layer, m].item()), dtype=torch.long),
+                "reward": torch.tensor(float(rewards_m[m].item()), dtype=torch.float32),
+                "action_mask": masks[m].detach().cpu(),           # [A] bool
+                "next_action_mask": next_masks[m].detach().cpu(), # [A] bool
+            })
+            self._last_transitions.append(out[-1])
+        return out
+
+    def _pf(self, ue: int, m: int, avg_tp_ref: torch.Tensor) -> float:
+        if ue == self.noop:
+            return 0.0
+        if self.buf[ue] <= 0:
+            return -1e9
+        rate = float(self._rate_mbps(ue).item())
+        denom = float((avg_tp_ref[ue] + self.eps).item())
+        return rate / denom
+
+    def _greedy_indicator_v(self, m: int, chosen: int, avg_tp_ref: torch.Tensor) -> float:
+        chosen_pf = self._pf(chosen, m, avg_tp_ref)
+        best_pf = chosen_pf
+        for ue in range(self.act_dim):
+            pf = self._pf(ue, m, avg_tp_ref)
+            if pf > best_pf:
+                best_pf = pf
+        return -1.0 if (best_pf > chosen_pf + 1e-12) else 1.0

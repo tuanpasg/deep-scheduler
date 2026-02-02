@@ -4,8 +4,9 @@ import os
 from collections import deque
 
 import torch
+import numpy as np
 
-from toy5g_env_adapter import DeterministicToy5GEnvAdapter
+from toy5g_env_adapter import DeterministicToy5GEnvAdapter, tbs_38214_bytes
 
 from DSACD_multibranch import (
     MultiBranchActor,
@@ -105,10 +106,17 @@ def evaluate_scheduler_metrics(
                     nosched += 1
 
             eval_env.apply_layer_actions(layer_ctx, actions.cpu())
+            eval_env.compute_layer_transitions(layer_ctx)
 
         # After all layers, env._alloc holds the chosen schedule for this TTI
         alloc = eval_env._alloc.detach().cpu()  # [L, M]
         ue_tti = torch.zeros((U,), dtype=torch.float32)
+
+        if not hasattr(eval_env, "_curr_mcs"):
+            eval_env._sample_mcs()
+        mcs = np.asarray(eval_env._curr_mcs, dtype=int)
+        buf_tmp = eval_env.buf.detach().cpu().clone() + float(eval_env.buf_arrival)
+        duration_s = eval_env.tti_ms / 1000.0
 
         # pairing metric per RBG
         for m in range(M):
@@ -118,7 +126,15 @@ def evaluate_scheduler_metrics(
                 if u == noop:
                     continue
                 scheduled_layers += 1
-                ue_tti[u] += float(eval_env._rate(u, m).detach().cpu().item())
+                tbs = tbs_38214_bytes(
+                    int(mcs[u]),
+                    int(eval_env.prbs_per_rbg),
+                    n_symb=int(eval_env.n_symb),
+                    overhead_re_per_prb=int(eval_env.overhead),
+                )
+                served = min(float(buf_tmp[u].item()), float(tbs))
+                buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
+                ue_tti[u] += float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
                 alloc_counts[u] += 1.0
             layers_per_rbg_sum += float(scheduled_layers)
             layers_per_rbg_den += 1
@@ -126,8 +142,7 @@ def evaluate_scheduler_metrics(
         total_ue_tput += ue_tti
         total_cell_tput += float(ue_tti.sum().item())
 
-        # advance env dynamics (buffers/avg_tp/reward generation)
-        eval_env.end_tti()
+        eval_env.finish_tti()
 
     invalid_action_rate = invalid / max(decisions, 1)
     no_schedule_rate = nosched / max(decisions, 1)
@@ -201,9 +216,16 @@ def evaluate_random_scheduler_metrics(
                     nosched += 1
 
             eval_env.apply_layer_actions(layer_ctx, actions)
+            eval_env.compute_layer_transitions(layer_ctx)
 
         alloc = eval_env._alloc.detach().cpu()  # [L, M]
         ue_tti = torch.zeros((U,), dtype=torch.float32)
+
+        if not hasattr(eval_env, "_curr_mcs"):
+            eval_env._sample_mcs()
+        mcs = np.asarray(eval_env._curr_mcs, dtype=int)
+        buf_tmp = eval_env.buf.detach().cpu().clone() + float(eval_env.buf_arrival)
+        duration_s = eval_env.tti_ms / 1000.0
 
         for m in range(M):
             scheduled_layers = 0
@@ -212,7 +234,15 @@ def evaluate_random_scheduler_metrics(
                 if u == noop:
                     continue
                 scheduled_layers += 1
-                ue_tti[u] += float(eval_env._rate(u, m).detach().cpu().item())
+                tbs = tbs_38214_bytes(
+                    int(mcs[u]),
+                    int(eval_env.prbs_per_rbg),
+                    n_symb=int(eval_env.n_symb),
+                    overhead_re_per_prb=int(eval_env.overhead),
+                )
+                served = min(float(buf_tmp[u].item()), float(tbs))
+                buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
+                ue_tti[u] += float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
                 alloc_counts[u] += 1.0
 
             layers_per_rbg_sum += float(scheduled_layers)
@@ -221,7 +251,7 @@ def evaluate_random_scheduler_metrics(
         total_ue_tput += ue_tti
         total_cell_tput += float(ue_tti.sum().item())
 
-        eval_env.end_tti()
+        eval_env.finish_tti()
 
     invalid_action_rate = invalid / max(decisions, 1)
     no_schedule_rate = nosched / max(decisions, 1)
@@ -384,17 +414,15 @@ def main(args):
                 fallback_action=args.fallback_action,
             )
 
-            # Adding layer action to tti action buffer
+            # Adding layer's action to tti action buffer [N_RBG, N_LAYER]
 
             # Update observation for the following layer
             env.apply_layer_actions(layer_ctx, actions_rbg)
+            transitions = env.compute_layer_transitions(layer_ctx)
+            for tr in transitions:
+                replay.add(tr)
 
-        env.end_tti()
-        transitions = env.export_branch_transitions()
-
-        # Adding experience to replay buffer
-        for tr in transitions:
-            replay.add(tr)
+        env.finish_tti()
 
         if replay.size >= args.learning_starts:
             batch = replay.sample(args.batch_size, device=device)
