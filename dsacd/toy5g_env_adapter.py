@@ -227,10 +227,6 @@ class DeterministicToy5GEnvAdapter:
         #     rank_ok = (counts < self.ue_rank.unsqueeze(0))  # [M, U]
         #     valid_ue = valid_ue & rank_ok
 
-        # masks = valid_ue
-        # noop_col = torch.ones((self.n_rbg, 1), device=self.device, dtype=torch.bool)
-        # return torch.cat([masks, noop_col], dim=1)  # [M, A]
-
         if layer > 0:
             # 1. Rank Check (Same as before)
             prev_allocs = self._alloc[:layer, :]
@@ -252,6 +248,10 @@ class DeterministicToy5GEnvAdapter:
             continuity_ok = (~ever_seen) | in_prev_layer
             
             valid_ue = valid_ue & rank_ok & continuity_ok
+            
+        masks = valid_ue
+        noop_col = torch.ones((self.n_rbg, 1), device=self.device, dtype=torch.bool)
+        return torch.cat([masks, noop_col], dim=1)  # [M, A]
 
     def _build_obs(self, layer: int) -> torch.Tensor:
         # Build structured features then pad/truncate to obs_dim.
