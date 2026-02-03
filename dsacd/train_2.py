@@ -5,6 +5,7 @@ from collections import deque
 
 import torch
 import numpy as np
+from pprint import pprint
 
 from toy5g_env_adapter import DeterministicToy5GEnvAdapter, tbs_38214_bytes
 
@@ -406,7 +407,15 @@ def main(args):
                 device=device,
                 fallback_action=args.fallback_action,
             )
+
+            print(f"LAYER ID: {layer_ctx.layer}")
+            print(f"MASK: {layer_ctx.masks_rbg}")
+            
             env.apply_layer_actions(layer_ctx, actions_rbg)
+            pprint(env.dump_state())
+
+            env.apply_layer_actions(layer_ctx, actions_rbg)
+            
             transitions = env.compute_layer_transitions(layer_ctx)
             for tr in transitions:
                 replay.add(tr)
