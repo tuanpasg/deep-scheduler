@@ -412,7 +412,10 @@ def main(args):
             )
 
             env.apply_layer_actions(layer_ctx, actions_rbg)
-
+            print(f"LAYER ID: {layer_ctx.layer}")
+            print(f"ACTIONS: {actions_rbg}")
+            print(f"mask_rbg: {layer_ctx.masks_rbg}")
+            pprint(env.dump_state)
             transitions = env.compute_layer_transitions(layer_ctx)
             for tr in transitions:
                 replay.add(tr)

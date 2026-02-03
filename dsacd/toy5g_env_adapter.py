@@ -248,7 +248,7 @@ class DeterministicToy5GEnvAdapter:
             continuity_ok = (~ever_seen) | in_prev_layer
             
             valid_ue = valid_ue & rank_ok & continuity_ok
-            
+
         masks = valid_ue
         noop_col = torch.ones((self.n_rbg, 1), device=self.device, dtype=torch.bool)
         return torch.cat([masks, noop_col], dim=1)  # [M, A]
@@ -383,7 +383,7 @@ class DeterministicToy5GEnvAdapter:
                 rewards_m[m] = 1.0 if (chosen == self.noop) else -1.0
             else:
                 rewards_m[m] = 0.0
-        
+        print("Appling actions on environment ....")
         print(f"served_rbg:{served_rbg}\nserved_layer:{served_layer}")
         print(f"Rewards:{rewards_m}")
         # 5) Apply service (drain buffers) for this layer after reward computation
@@ -395,6 +395,7 @@ class DeterministicToy5GEnvAdapter:
             self.buf[ue] = torch.clamp(self.buf[ue] - served, min=0.0)
 
         # next state after this layer
+        print("Next obesrvation:")
         next_layer_idx = min(layer + 1, self.n_layers - 1)
         next_masks = self._build_masks(layer=next_layer_idx)
         next_obs = self._build_obs(layer=next_layer_idx)
