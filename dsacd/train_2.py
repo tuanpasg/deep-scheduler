@@ -513,8 +513,8 @@ if __name__ == "__main__":
     p.add_argument("--learning_starts", type=int, default=256)
     p.add_argument("--log_every", type=int, default=20)
 
-    p.add_argument("--obs_dim", type=int, default=410)
-    p.add_argument("--act_dim", type=int, default=11)
+    p.add_argument("--obs_dim", type=int, default=164)
+    p.add_argument("--act_dim", type=int, default=5)
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--n_rbg", type=int, default=18)
     p.add_argument("--fallback_action", type=int, default=0)

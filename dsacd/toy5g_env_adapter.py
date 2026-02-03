@@ -127,7 +127,8 @@ class DeterministicToy5GEnvAdapter:
 
         # Fading profile: fixed per-UE MCS mean (constant through layers/RBGs)
         self.rng = np.random.default_rng(seed)
-        self.mcs_mean = self.rng.integers(0, self.max_mcs + 1, size=(self.n_ue,))
+        # self.mcs_mean = self.rng.integers(0, self.max_mcs + 1, size=(self.n_ue,))
+        self.mcs_mean = np.full((self.n_ue,), 20, dtype=int)
         self.mcs_spread = 0
         self._sample_mcs()
 
