@@ -24,6 +24,7 @@ from train_2_logging import (
     plot_eval,
     plot_training,
     save_logs,
+    plot_allocation,
 )
 
 
@@ -335,6 +336,8 @@ def sample_actions_for_layer(actor: MultiBranchActor,
 
 
 def main(args):
+    os.makedirs(args.out_dir, exist_ok=True)
+
     device = torch.device(args.device)
 
     env = DeterministicToy5GEnvAdapter(
@@ -408,17 +411,16 @@ def main(args):
                 fallback_action=args.fallback_action,
             )
 
-            print(f"LAYER ID: {layer_ctx.layer}")
-            print(f"MASK: {layer_ctx.masks_rbg}")
-            
             env.apply_layer_actions(layer_ctx, actions_rbg)
-            pprint(env.dump_state())
 
-            env.apply_layer_actions(layer_ctx, actions_rbg)
-            
             transitions = env.compute_layer_transitions(layer_ctx)
             for tr in transitions:
                 replay.add(tr)
+
+        # Plot allocation map periodically
+        if tti > 0 and tti % args.log_every == 0:
+            plot_path = os.path.join(args.out_dir, f"alloc_tti_{tti:05d}.png")
+            plot_allocation(env._alloc, env.n_ue, plot_path)
 
         env.finish_tti()
 

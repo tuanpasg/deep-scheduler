@@ -217,19 +217,41 @@ class DeterministicToy5GEnvAdapter:
         # We check: count(allocs in previous layers) < ue_rank
         # Note: This counts spatial layers per RBG. Allocating multiple RBGs on the same layer
         #       does NOT increase the rank count (it counts as 1 layer for those RBGs).
-        if layer > 0:
-            # prev_alloc: [layer, M]
-            prev_alloc = self._alloc[:layer, :]
-            # Count occurrences: [M, U]
-            u_indices = torch.arange(self.n_ue, device=self.device).view(1, 1, -1)
-            matches = (prev_alloc.unsqueeze(-1) == u_indices)
-            counts = matches.sum(dim=0)  # [M, U]
-            rank_ok = (counts < self.ue_rank.unsqueeze(0))  # [M, U]
-            valid_ue = valid_ue & rank_ok
+        # if layer > 0:
+        #     # prev_alloc: [layer, M]
+        #     prev_alloc = self._alloc[:layer, :]
+        #     # Count occurrences: [M, U]
+        #     u_indices = torch.arange(self.n_ue, device=self.device).view(1, 1, -1)
+        #     matches = (prev_alloc.unsqueeze(-1) == u_indices)
+        #     counts = matches.sum(dim=0)  # [M, U]
+        #     rank_ok = (counts < self.ue_rank.unsqueeze(0))  # [M, U]
+        #     valid_ue = valid_ue & rank_ok
 
-        masks = valid_ue
-        noop_col = torch.ones((self.n_rbg, 1), device=self.device, dtype=torch.bool)
-        return torch.cat([masks, noop_col], dim=1)  # [M, A]
+        # masks = valid_ue
+        # noop_col = torch.ones((self.n_rbg, 1), device=self.device, dtype=torch.bool)
+        # return torch.cat([masks, noop_col], dim=1)  # [M, A]
+
+        if layer > 0:
+            # 1. Rank Check (Same as before)
+            prev_allocs = self._alloc[:layer, :]
+            u_indices = torch.arange(self.n_ue, device=self.device).view(1, 1, -1)
+            matches = (prev_allocs.unsqueeze(-1) == u_indices)
+            counts = matches.sum(dim=0)  # [M, U]
+            rank_ok = (counts < self.ue_rank.unsqueeze(0)) 
+
+            # 2. Per-UE Continuity Check
+            # Has the UE ever been seen in this RBG before?
+            ever_seen = counts > 0  # [M, U]
+            
+            # Was the UE in the layer immediately before this one?
+            last_layer_alloc = self._alloc[layer - 1, :]
+            in_prev_layer = (last_layer_alloc.unsqueeze(-1) == torch.arange(self.n_ue, device=self.device).view(1, -1)) # [M, U]
+
+            # Logic: If ever_seen is True, then in_prev_layer MUST be True.
+            # If ever_seen is False, the UE is a "new starter" and is valid.
+            continuity_ok = (~ever_seen) | in_prev_layer
+            
+            valid_ue = valid_ue & rank_ok & continuity_ok
 
     def _build_obs(self, layer: int) -> torch.Tensor:
         # Build structured features then pad/truncate to obs_dim.

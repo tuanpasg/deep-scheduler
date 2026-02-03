@@ -2,7 +2,8 @@ import json
 import os
 
 import matplotlib.pyplot as plt
-
+import numpy as np
+import torch
 
 def init_eval_log():
     return {
@@ -136,3 +137,38 @@ def save_logs(out_dir: str, eval_log: dict, train_log: dict):
         json.dump(eval_log, f, indent=2)
     with open(os.path.join(out_dir, "train_log.json"), "w", encoding="utf-8") as f:
         json.dump(train_log, f, indent=2)
+
+def plot_allocation(alloc_tensor, n_ue, out_path: str):
+    # Convert to numpy for plotting
+    # alloc_tensor shape: [Layers, RBGs]
+    data = alloc_tensor.cpu().numpy()
+    
+    fig = plt.figure(figsize=(12, 6))
+    
+    # We use a discrete colormap. 'tab20' is good for up to 20 UEs.
+    # We add +1 to account for a "NOOP" or "Empty" value if necessary.
+    cmap = plt.get_cmap('tab20', n_ue + 1) 
+    
+    # Plotting the heatmap
+    im = plt.imshow(data, aspect='auto', cmap=cmap, interpolation='nearest', vmin=0, vmax=n_ue)
+    
+    # Add Colorbar with UE labels
+    cbar = plt.colorbar(im, ticks=range(n_ue + 1))
+    cbar.set_label('UE Index')
+    
+    plt.title(f"MU-MIMO Allocation Map (RBG vs Layers) - TTI: {os.path.basename(out_path)}")
+    plt.xlabel("Resource Block Groups (RBG)")
+    plt.ylabel("Spatial Layers")
+    
+    # Set integer ticks for clarity
+    if data.shape[1] > 0:
+        plt.xticks(np.arange(data.shape[1]))
+    if data.shape[0] > 0:
+        plt.yticks(np.arange(data.shape[0]))
+    
+    plt.grid(which='both', color='white', linestyle='-', linewidth=0.5, alpha=0.3)
+    fig.savefig(out_path, dpi=100)
+    plt.close(fig)
+
+# Example usage:
+# plot_allocation(self._alloc, self.n_ue)
