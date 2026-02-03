@@ -78,7 +78,6 @@ class DeterministicToy5GEnvAdapter:
         ema_beta: float = 0.98,
         eps: float = 1e-6,
         # deterministic traffic/channel knobs
-        base_rate: float = 1.0,
         buf_init: int = 50_000,
         buf_arrival: int = 10_000,
         tti_ms: float = 1.0,
@@ -99,7 +98,6 @@ class DeterministicToy5GEnvAdapter:
         self.max_ue_rank = 2
         self.ema_beta = float(ema_beta)
         self.eps = float(eps)
-        self.base_rate = float(base_rate)
         self.buf_init = int(buf_init)
         self.buf_arrival = int(buf_arrival)
         self.tti_ms = float(tti_ms)
@@ -115,7 +113,7 @@ class DeterministicToy5GEnvAdapter:
         # State
         self.t = 0
         self.buf = torch.full((self.n_ue,), self.buf_init, device=self.device, dtype=torch.float32)  # bytes
-        self.avg_tp = torch.full((self.n_ue,), 1.0, device=self.device, dtype=torch.float32)          # EMA throughput (Mbps)
+        self.avg_tp = torch.full((self.n_ue,), self.eps, device=self.device, dtype=torch.float32)          # EMA throughput (Mbps)
 
         # Allocation caches (per TTI)
         self._alloc = torch.full((self.n_layers, self.n_rbg), self.noop, device=self.device, dtype=torch.long)
@@ -137,7 +135,7 @@ class DeterministicToy5GEnvAdapter:
     def reset(self):
         self.t = 0
         self.buf.fill_(self.buf_init)
-        self.avg_tp.fill_(1.0)
+        self.avg_tp.fill_(self.eps)
         self._alloc.fill_(self.noop)
         self._last_transitions = []
         self._cur_layer = None
@@ -265,11 +263,14 @@ class DeterministicToy5GEnvAdapter:
         mcs = torch.tensor(self._curr_mcs, device=self.device, dtype=torch.float32)
         norm_wb_cqi = torch.clamp(mcs / float(self.max_mcs), 0.0, 1.0)
 
-        reserved = torch.zeros((self.n_ue, 2), device=self.device, dtype=torch.float32)
+        reserved = torch.zeros((self.n_ue, 2*self.n_rbg), device=self.device, dtype=torch.float32)
         ue_feats = torch.stack(
             [norm_past_avg_tp, norm_ue_rank, norm_allocated_rbgs, norm_buffer, norm_wb_cqi],
             dim=1,
         )
+
+        print("UE Feats:", ue_feats)
+
         ue_feats = torch.cat([ue_feats, reserved], dim=1)  # [U, 7]
         core = ue_feats.reshape(-1).float()
 
@@ -313,7 +314,7 @@ class DeterministicToy5GEnvAdapter:
             served_rbg[m] = served
             buf_tmp[ue] = torch.clamp(buf_tmp[ue] - served, min=0.0)
             served_layer[ue] += served
-
+        
         duration_s = self.tti_ms / 1000.0
         tp_layer = (served_layer * 8.0) / 1e6 / max(duration_s, 1e-9)
 
@@ -360,7 +361,9 @@ class DeterministicToy5GEnvAdapter:
                 rewards_m[m] = 1.0 if (chosen == self.noop) else -1.0
             else:
                 rewards_m[m] = 0.0
-
+        
+        print(f"served_rbg:{served_rbg}\nserved_layer:{served_layer}")
+        print(f"Rewards:{rewards_m}")
         # 5) Apply service (drain buffers) for this layer after reward computation
         for m in range(self.n_rbg):
             ue = int(self._alloc[layer, m].item())
