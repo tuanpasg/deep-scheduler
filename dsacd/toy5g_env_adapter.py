@@ -155,7 +155,7 @@ class DeterministicToy5GEnvAdapter:
         # We yield layer contexts one by one; obs is global state + layer id encoding.
         for l in range(self.n_layers):
             self._cur_layer = l
-            masks = self._build_masks()  # [M, A]
+            masks = self._build_masks(layer=l)  # [M, A]
             obs = self._build_obs(layer=l)  # [obs_dim]
             yield LayerContext(layer=l, obs=obs, masks_rbg=masks)
 
@@ -169,6 +169,19 @@ class DeterministicToy5GEnvAdapter:
 
     def export_branch_transitions(self) -> List[Dict]:
         return self._last_transitions
+
+    def dump_state(self) -> Dict:
+        """Return a dict of the current environment state (buffers, rates, allocs)."""
+        return {
+            "t": self.t,
+            "buf": self.buf.detach().cpu().tolist(),
+            "avg_tp": self.avg_tp.detach().cpu().tolist(),
+            "alloc": self._alloc.detach().cpu().tolist(),
+            "curr_mcs": self._curr_mcs.tolist() if hasattr(self, "_curr_mcs") else None,
+            "ue_rank": self.ue_rank.detach().cpu().tolist(),
+            "mcs_mean": self.mcs_mean.tolist() if hasattr(self, "mcs_mean") else None,
+            "cur_layer": self._cur_layer,
+        }
 
     def compute_layer_transitions(self, layer_ctx: LayerContext) -> List[Dict]:
         """Compute rewards and package transitions for a single layer using cached obs/masks."""
@@ -195,10 +208,28 @@ class DeterministicToy5GEnvAdapter:
         duration_s = self.tti_ms / 1000.0
         return (served * 8.0) / 1e6 / max(duration_s, 1e-9)
 
-    def _build_masks(self) -> torch.Tensor:
+    def _build_masks(self, layer: Optional[int] = None) -> torch.Tensor:
+        if layer is None:
+            layer = self._cur_layer if self._cur_layer is not None else 0
+
         # valid UE if buffer > 0, NOOP always valid
-        valid_ue = (self.buf > 0.0)  # [U]
-        masks = valid_ue.unsqueeze(0).repeat(self.n_rbg, 1)  # [M, U]
+        valid_ue = (self.buf > 0.0).unsqueeze(0).expand(self.n_rbg, -1)  # [M, U]
+
+        # Rank constraint: UE rank >= total allocated layers for this RBG
+        # We check: count(allocs in previous layers) < ue_rank
+        # Note: This counts spatial layers per RBG. Allocating multiple RBGs on the same layer
+        #       does NOT increase the rank count (it counts as 1 layer for those RBGs).
+        if layer > 0:
+            # prev_alloc: [layer, M]
+            prev_alloc = self._alloc[:layer, :]
+            # Count occurrences: [M, U]
+            u_indices = torch.arange(self.n_ue, device=self.device).view(1, 1, -1)
+            matches = (prev_alloc.unsqueeze(-1) == u_indices)
+            counts = matches.sum(dim=0)  # [M, U]
+            rank_ok = (counts < self.ue_rank.unsqueeze(0))  # [M, U]
+            valid_ue = valid_ue & rank_ok
+
+        masks = valid_ue
         noop_col = torch.ones((self.n_rbg, 1), device=self.device, dtype=torch.bool)
         return torch.cat([masks, noop_col], dim=1)  # [M, A]
 
@@ -339,8 +370,9 @@ class DeterministicToy5GEnvAdapter:
             self.buf[ue] = torch.clamp(self.buf[ue] - served, min=0.0)
 
         # next state after this layer
-        next_masks = self._build_masks()
-        next_obs = self._build_obs(layer=min(layer + 1, self.n_layers - 1))
+        next_layer_idx = min(layer + 1, self.n_layers - 1)
+        next_masks = self._build_masks(layer=next_layer_idx)
+        next_obs = self._build_obs(layer=next_layer_idx)
 
         out = []
         for m in range(self.n_rbg):
@@ -355,21 +387,3 @@ class DeterministicToy5GEnvAdapter:
             })
             self._last_transitions.append(out[-1])
         return out
-
-    def _pf(self, ue: int, m: int, avg_tp_ref: torch.Tensor) -> float:
-        if ue == self.noop:
-            return 0.0
-        if self.buf[ue] <= 0:
-            return -1e9
-        rate = float(self._rate_mbps(ue).item())
-        denom = float((avg_tp_ref[ue] + self.eps).item())
-        return rate / denom
-
-    def _greedy_indicator_v(self, m: int, chosen: int, avg_tp_ref: torch.Tensor) -> float:
-        chosen_pf = self._pf(chosen, m, avg_tp_ref)
-        best_pf = chosen_pf
-        for ue in range(self.act_dim):
-            pf = self._pf(ue, m, avg_tp_ref)
-            if pf > best_pf:
-                best_pf = pf
-        return -1.0 if (best_pf > chosen_pf + 1e-12) else 1.0

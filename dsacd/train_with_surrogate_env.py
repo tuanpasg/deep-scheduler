@@ -210,8 +210,6 @@ def main(args):
         n_rbg=args.n_rbg,
         device=args.device,
         seed=args.seed,
-        k=0.2,       # paper factor
-        gmax=1.0,    # training-only normalizer (toy: keep 1.0)
     )
 
     eval_env = DeterministicToy5GEnvAdapter(
@@ -221,8 +219,6 @@ def main(args):
         n_rbg=args.n_rbg,
         device=args.device,
         seed=args.seed + 12345,   # different seed OK; use same if you want exact-repeat eval
-        k=0.2,       # paper factor
-        gmax=1.0,    # training-only normalizer (toy: keep 1.0)
     )
 
     # Networks
