@@ -17,6 +17,7 @@ from DSACD_multibranch import (
     ensure_nonempty_mask,
     apply_action_mask_to_logits,
 )
+
 from train_2_logging import (
     init_eval_log,
     init_train_log,
@@ -412,18 +413,18 @@ def main(args):
             )
 
             env.apply_layer_actions(layer_ctx, actions_rbg)
-            print(f"LAYER ID: {layer_ctx.layer}")
-            print(f"ACTIONS: {actions_rbg}")
-            print(f"mask_rbg: {layer_ctx.masks_rbg}")
-            pprint(env.dump_state)
+            # print(f"LAYER ID: {layer_ctx.layer}")
+            # print(f"ACTIONS: {actions_rbg}")
+            # print(f"mask_rbg: {layer_ctx.masks_rbg}")
+            # pprint(env.dump_state())
             transitions = env.compute_layer_transitions(layer_ctx)
             for tr in transitions:
                 replay.add(tr)
 
         # Plot allocation map periodically
         if tti > 0 and tti % args.log_every == 0:
-            plot_path = os.path.join(args.out_dir, f"alloc_tti_{tti:05d}.png")
-            plot_allocation(env._alloc, env.n_ue, plot_path)
+          plot_path = os.path.join(args.out_dir, f"alloc_tti_{tti:05d}.png")
+          plot_allocation(env._alloc, env.n_ue, plot_path)
 
         env.finish_tti()
 
@@ -469,7 +470,7 @@ def main(args):
             m_rand = evaluate_random_scheduler_metrics(
                 eval_env,
                 eval_ttis=args.eval_ttis,
-                seed=args.seed + 999,
+                seed=args.seed + 999 + tti,
             )
 
             append_eval(eval_log, "sample", tti, m_sample)
@@ -477,19 +478,19 @@ def main(args):
             append_eval(eval_log, "random", tti, m_rand)
 
             msg += (
-                f" | SAMPLE cell_tput={m_sample['total_cell_tput']:.2f}"
+                f" \nSAMPLE cell_tput={m_sample['total_cell_tput']:.2f}"
                 f" jain={m_sample['jain_throughput']:.3f}"
                 f" pfU={m_sample['pf_utility']:.2f}"
                 f" inv={m_sample['invalid_action_rate']:.3f}"
                 f" noop={m_sample['no_schedule_rate']:.3f}"
                 f" layers/RBG={m_sample['avg_layers_per_rbg']:.2f}"
-                f" || GREEDY cell_tput={m_greedy['total_cell_tput']:.2f}"
+                f" \nGREEDY cell_tput={m_greedy['total_cell_tput']:.2f}"
                 f" jain={m_greedy['jain_throughput']:.3f}"
                 f" pfU={m_greedy['pf_utility']:.2f}"
                 f" inv={m_greedy['invalid_action_rate']:.3f}"
                 f" noop={m_greedy['no_schedule_rate']:.3f}"
                 f" layers/RBG={m_greedy['avg_layers_per_rbg']:.2f}"
-                f" || RANDOM cell_tput={m_rand['total_cell_tput']:.2f}"
+                f" \nRANDOM cell_tput={m_rand['total_cell_tput']:.2f}"
                 f" jain={m_rand['jain_throughput']:.3f}"
                 f" pfU={m_rand['pf_utility']:.2f}"
                 f" inv={m_rand['invalid_action_rate']:.3f}"
@@ -532,8 +533,8 @@ if __name__ == "__main__":
     p.add_argument("--lr_critic", type=float, default=1e-4)
     p.add_argument("--lr_alpha", type=float, default=1e-4)
 
-    p.add_argument("--eval_every", type=int, default=50)
-    p.add_argument("--eval_ttis", type=int, default=50)
+    p.add_argument("--eval_every", type=int, default=30)
+    p.add_argument("--eval_ttis", type=int, default=30)
     p.add_argument("--out_dir", type=str, default=os.path.join("outputs", "train_2"))
 
     args = p.parse_args()

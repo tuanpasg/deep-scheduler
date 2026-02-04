@@ -84,6 +84,7 @@ class DeterministicToy5GEnvAdapter:
         prbs_per_rbg: int = 18,
         n_symb: int = 14,
         overhead_re_per_prb: int = 18,
+        internal_log: bool = False
     ):
         assert act_dim >= 2, "Need at least 1 UE + NOOP."
         self.obs_dim = obs_dim
@@ -123,13 +124,19 @@ class DeterministicToy5GEnvAdapter:
         self._avg_tp_before_tti: Optional[torch.Tensor] = None
 
         # Per-UE rank capability (spatial layers supported), max rank = 2
-        self.ue_rank = (1 + (torch.arange(self.n_ue) % 2)).to(self.device).float()
+        # self.ue_rank = (1 + (torch.arange(self.n_ue) % 2)).to(self.device).float()
+        self.ue_rank = torch.ones((self.n_ue,))*2
 
         # Fading profile: fixed per-UE MCS mean (constant through layers/RBGs)
         self.rng = np.random.default_rng(seed)
         # self.mcs_mean = self.rng.integers(0, self.max_mcs + 1, size=(self.n_ue,))
-        self.mcs_mean = np.full((self.n_ue,), 20, dtype=int)
-        self.mcs_spread = 0
+        # self.mcs_mean = np.full((self.n_ue,), 20, dtype=int)
+        self.mcs_mean = np.array([5,10,25,5])
+        self.mcs_spread = 1
+
+        self.internal_log = internal_log
+
+        self.max_cross_corr = np.random.rand(self.n_ue, self.n_ue, self.n_rbg)
         self._sample_mcs()
 
     # ---------- Public API ----------
@@ -195,10 +202,10 @@ class DeterministicToy5GEnvAdapter:
         self.t += 1
 
     # ---------- Internals ----------
-    def _served_bytes(self, ue: int) -> torch.Tensor:
+    def _served_bytes(self, ue: int, m: int) -> torch.Tensor:
         if not hasattr(self, "_curr_mcs"):
             self._sample_mcs()
-        mcs = int(self._curr_mcs[ue])
+        mcs = int(self.curr_mcs_subband[ue,m])
         tbs = tbs_38214_bytes(mcs, self.prbs_per_rbg, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
         return torch.tensor(float(tbs), device=self.device)
 
@@ -285,16 +292,41 @@ class DeterministicToy5GEnvAdapter:
             self._sample_mcs()
         mcs = torch.tensor(self._curr_mcs, device=self.device, dtype=torch.float32)
         norm_wb_cqi = torch.clamp(mcs / float(self.max_mcs), 0.0, 1.0)
+        
+        norm_subband_cqi = torch.tensor(self.curr_mcs_subband, device=self.device, dtype=torch.float32) / float(self.max_mcs)
 
-        reserved = torch.zeros((self.n_ue, 2*self.n_rbg), device=self.device, dtype=torch.float32)
+        # New feature: Max Cross Correlation with previously scheduled UEs on the same RBG
+        # Shape: [n_ue, n_rbg]
+        max_corr_feat = torch.zeros((self.n_ue, self.n_rbg), device=self.device, dtype=torch.float32)
+        if layer > 0:
+            # Convert table to tensor (shape [U, U, M])
+            cross_corr = torch.as_tensor(self.max_cross_corr, device=self.device, dtype=torch.float32)
+            prev_alloc = self._alloc[:layer, :]  # [L', M]
+
+            for m in range(self.n_rbg):
+                # Identify UEs scheduled in this RBG in previous layers
+                scheduled_ues = prev_alloc[:, m]
+                valid_mask = (scheduled_ues != self.noop)
+                valid_ues = scheduled_ues[valid_mask]  # [k]
+
+                if valid_ues.numel() > 0:
+                    # For all candidate UEs (dim 0), get correlations with valid_ues (dim 1) at RBG m
+                    # cross_corr[:, valid_ues, m] -> [U, k]
+                    # Take max over the set of scheduled UEs
+                    vals, _ = cross_corr[:, valid_ues, m].max(dim=1)
+                    max_corr_feat[:, m] = vals
+
+        
         ue_feats = torch.stack(
             [norm_past_avg_tp, norm_ue_rank, norm_allocated_rbgs, norm_buffer, norm_wb_cqi],
             dim=1,
         )
+        
+        if(self.internal_log):
+          print("UE Feats:", ue_feats)
 
-        print("UE Feats:", ue_feats)
-
-        ue_feats = torch.cat([ue_feats, reserved], dim=1)  # [U, 7]
+        # ue_feats = torch.cat([ue_feats, max_corr_feat], dim=1)  # [U, 5 + n_rbg]
+        ue_feats = torch.cat([ue_feats, norm_subband_cqi, max_corr_feat], dim=1)  # [U, 5 + 2*n_rbg]
         core = ue_feats.reshape(-1).float()
 
         if core.numel() >= self.obs_dim:
@@ -307,9 +339,13 @@ class DeterministicToy5GEnvAdapter:
         if self.mcs_spread == 0:
             mcs = self.mcs_mean.copy()
         else:
-            jitter = self.rng.integers(-self.mcs_spread, self.mcs_spread + 1, size=self.n_ue)
+            jitter = self.rng.integers(-self.mcs_spread, self.mcs_spread + 1, size=(self.n_ue))
             mcs = np.clip(self.mcs_mean + jitter, 0, self.max_mcs)
         self._curr_mcs = np.asarray(mcs, dtype=int)
+
+        jitter = self.rng.integers(-self.mcs_spread, self.mcs_spread + 1, size=(self.n_ue, self.n_rbg))
+        self.curr_mcs_subband = np.clip(self._curr_mcs.reshape(-1,1) + jitter, 0, self.max_mcs)
+
         return self._curr_mcs
 
     def _ensure_tti_start(self):
@@ -332,7 +368,7 @@ class DeterministicToy5GEnvAdapter:
                 continue
             if buf_tmp[ue] <= 0:
                 continue  # should be masked but keep safe
-            served = self._served_bytes(ue)
+            served = self._served_bytes(ue,m)
             served = torch.minimum(buf_tmp[ue], served)
             served_rbg[m] = served
             buf_tmp[ue] = torch.clamp(buf_tmp[ue] - served, min=0.0)
@@ -384,9 +420,11 @@ class DeterministicToy5GEnvAdapter:
                 rewards_m[m] = 1.0 if (chosen == self.noop) else -1.0
             else:
                 rewards_m[m] = 0.0
-        print("Appling actions on environment ....")
-        print(f"served_rbg:{served_rbg}\nserved_layer:{served_layer}")
-        print(f"Rewards:{rewards_m}")
+
+        if(self.internal_log):
+          print("Appling actions on environment ....")
+          print(f"served_rbg:{served_rbg}\nserved_layer:{served_layer}")
+          print(f"Rewards:{rewards_m}")
         # 5) Apply service (drain buffers) for this layer after reward computation
         for m in range(self.n_rbg):
             ue = int(self._alloc[layer, m].item())
@@ -396,7 +434,8 @@ class DeterministicToy5GEnvAdapter:
             self.buf[ue] = torch.clamp(self.buf[ue] - served, min=0.0)
 
         # next state after this layer
-        print("Next obesrvation:")
+        if(self.internal_log):
+          print("Next obesrvation:")
         next_layer_idx = min(layer + 1, self.n_layers - 1)
         next_masks = self._build_masks(layer=next_layer_idx)
         next_obs = self._build_obs(layer=next_layer_idx)

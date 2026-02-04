@@ -16,6 +16,7 @@ from DSACD_multibranch import (
     ensure_nonempty_mask,
     apply_action_mask_to_logits,
 )
+
 from train_2_logging import (
     init_eval_log,
     init_train_log,
@@ -461,7 +462,7 @@ def main(args):
             m_rand = evaluate_random_scheduler_metrics(
                 eval_env,
                 eval_ttis=args.eval_ttis,
-                seed=args.seed + 999,
+                seed=args.seed + 999 + tti,
             )
 
             append_eval(eval_log, "sample", tti, m_sample)
