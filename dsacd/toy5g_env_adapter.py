@@ -386,6 +386,15 @@ class DeterministicToy5GEnvAdapter:
         for m in range(self.n_rbg):
             chosen = int(self._alloc[layer, m].item())
 
+            # Identify UEs scheduled in previous layers on this RBG
+            scheduled_ues = []
+            if layer > 0:
+                prev_alloc = self._alloc[:layer, m]
+                for l_prev in range(layer):
+                    u_prev = int(prev_alloc[l_prev].item())
+                    if u_prev != self.noop:
+                        scheduled_ues.append(u_prev)
+
             raw_all = torch.empty((self.n_ue,), device=self.device, dtype=torch.float32)
             for u in range(self.n_ue):
                 if self.buf[u] <= 0:
@@ -394,6 +403,15 @@ class DeterministicToy5GEnvAdapter:
 
                 Ru = float((avg_tp_before_tti[u] + self.eps).item())
                 Tu = float(self._rate_mbps(u,m).item())
+
+                # Apply spatial interference penalty: Tu *= (1 - max_cross_corr)
+                penalty = 0.0
+                if len(scheduled_ues) > 0:
+                    # max_cross_corr is [U, U, M]. Get max corr with any scheduled UE on this RBG.
+                    corrs = [self.max_cross_corr[u, v, m] for v in scheduled_ues]
+                    penalty = max(corrs)
+                
+                Tu = Tu * (1.0 - penalty)
 
                 if layer == 0:
                     raw_all[u] = Tu / Ru
