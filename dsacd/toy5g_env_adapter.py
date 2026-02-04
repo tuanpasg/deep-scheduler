@@ -209,8 +209,8 @@ class DeterministicToy5GEnvAdapter:
         tbs = tbs_38214_bytes(mcs, self.prbs_per_rbg, n_symb=self.n_symb, overhead_re_per_prb=self.overhead)
         return torch.tensor(float(tbs), device=self.device)
 
-    def _rate_mbps(self, ue: int) -> torch.Tensor:
-        served = self._served_bytes(ue)
+    def _rate_mbps(self, ue: int, m: int) -> torch.Tensor:
+        served = self._served_bytes(ue, m)
         duration_s = self.tti_ms / 1000.0
         return (served * 8.0) / 1e6 / max(duration_s, 1e-9)
 
@@ -325,7 +325,6 @@ class DeterministicToy5GEnvAdapter:
         if(self.internal_log):
           print("UE Feats:", ue_feats)
 
-        # ue_feats = torch.cat([ue_feats, max_corr_feat], dim=1)  # [U, 5 + n_rbg]
         ue_feats = torch.cat([ue_feats, norm_subband_cqi, max_corr_feat], dim=1)  # [U, 5 + 2*n_rbg]
         core = ue_feats.reshape(-1).float()
 
@@ -394,7 +393,7 @@ class DeterministicToy5GEnvAdapter:
                     continue
 
                 Ru = float((avg_tp_before_tti[u] + self.eps).item())
-                Tu = float(self._rate_mbps(u).item())
+                Tu = float(self._rate_mbps(u,m).item())
 
                 if layer == 0:
                     raw_all[u] = Tu / Ru
