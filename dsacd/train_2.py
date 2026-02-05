@@ -123,23 +123,43 @@ def evaluate_scheduler_metrics(
 
         # pairing metric per RBG
         for m in range(M):
-            scheduled_layers = 0
+            # Get all unique UEs scheduled on this RBG, ignoring NOOPs.
+            scheduled_ues_on_rbg = sorted(list(set(u for u in alloc[:, m].tolist() if u != noop)))
+
+            # Find the maximum cross-correlation between any pair of UEs on this RBG
+            max_cross_corr_rbg = 0.0
+            if len(scheduled_ues_on_rbg) > 1:
+                corrs = []
+                for i in range(len(scheduled_ues_on_rbg)):
+                    for j in range(i + 1, len(scheduled_ues_on_rbg)):
+                        u1 = scheduled_ues_on_rbg[i]
+                        u2 = scheduled_ues_on_rbg[j]
+                        # CRITICAL FIX: max_cross_corr is [U, U, M], requires RBG index 'm'
+                        corrs.append(eval_env.max_cross_corr[u1, u2, m])
+                if corrs:
+                    max_cross_corr_rbg = max(corrs)
+
+            # LOGIC FIX: The penalty should model interference, not divide the resource.
+            # The original division by scheduled_layers_rbg incorrectly assumes total
+            # throughput is constant, which defeats the purpose of MU-MIMO.
+            penalty = 1.0 - max_cross_corr_rbg
+
+            scheduled_layers_rbg = len([u for u in alloc[:, m].tolist() if u != noop])
             for l in range(L):
                 u = int(alloc[l, m].item())
                 if u == noop:
                     continue
-                scheduled_layers += 1
                 tbs = tbs_38214_bytes(
                     int(mcs[u]),
                     int(eval_env.prbs_per_rbg),
                     n_symb=int(eval_env.n_symb),
                     overhead_re_per_prb=int(eval_env.overhead),
                 )
-                served = min(float(buf_tmp[u].item()), float(tbs))
+                served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
                 buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
                 ue_tti[u] += float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
                 alloc_counts[u] += 1.0
-            layers_per_rbg_sum += float(scheduled_layers)
+            layers_per_rbg_sum += float(scheduled_layers_rbg)
             layers_per_rbg_den += 1
 
         total_ue_tput += ue_tti
@@ -233,24 +253,44 @@ def evaluate_random_scheduler_metrics(
         duration_s = eval_env.tti_ms / 1000.0
 
         for m in range(M):
-            scheduled_layers = 0
+            # Get all unique UEs scheduled on this RBG, ignoring NOOPs.
+            scheduled_ues_on_rbg = sorted(list(set(u for u in alloc[:, m].tolist() if u != noop)))
+
+            # Find the maximum cross-correlation between any pair of UEs on this RBG
+            max_cross_corr_rbg = 0.0
+            if len(scheduled_ues_on_rbg) > 1:
+                corrs = []
+                for i in range(len(scheduled_ues_on_rbg)):
+                    for j in range(i + 1, len(scheduled_ues_on_rbg)):
+                        u1 = scheduled_ues_on_rbg[i]
+                        u2 = scheduled_ues_on_rbg[j]
+                        # CRITICAL FIX: max_cross_corr is [U, U, M], requires RBG index 'm'
+                        corrs.append(eval_env.max_cross_corr[u1, u2, m])
+                if corrs:
+                    max_cross_corr_rbg = max(corrs)
+
+            # LOGIC FIX: The penalty should model interference, not divide the resource.
+            # The original division by scheduled_layers_rbg incorrectly assumes total
+            # throughput is constant, which defeats the purpose of MU-MIMO.
+            penalty = 1.0 - max_cross_corr_rbg
+
+            scheduled_layers_rbg = len([u for u in alloc[:, m].tolist() if u != noop])   
             for l in range(L):
                 u = int(alloc[l, m].item())
                 if u == noop:
                     continue
-                scheduled_layers += 1
                 tbs = tbs_38214_bytes(
                     int(mcs[u]),
                     int(eval_env.prbs_per_rbg),
                     n_symb=int(eval_env.n_symb),
                     overhead_re_per_prb=int(eval_env.overhead),
                 )
-                served = min(float(buf_tmp[u].item()), float(tbs))
+                served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
                 buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
                 ue_tti[u] += float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
                 alloc_counts[u] += 1.0
 
-            layers_per_rbg_sum += float(scheduled_layers)
+            layers_per_rbg_sum += float(scheduled_layers_rbg)
             layers_per_rbg_den += 1
 
         total_ue_tput += ue_tti
