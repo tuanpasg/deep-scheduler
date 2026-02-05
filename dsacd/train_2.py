@@ -159,6 +159,8 @@ def evaluate_scheduler_metrics(
         "eval_ttis": int(eval_ttis),
         "total_cell_tput": float(total_cell_tput),
         "total_ue_tput": total_ue_tput,          # tensor [U]
+        "avg_cell_tput": float(total_cell_tput)/float(eval_ttis),
+        "avg_ue_tput": total_ue_tput/float(eval_ttis),          # tensor [U]
         "alloc_counts": alloc_counts,            # tensor [U]
         "jain_throughput": float(jain_throughput),
         "pf_utility": float(pf_utility),
@@ -268,6 +270,8 @@ def evaluate_random_scheduler_metrics(
         "eval_ttis": int(eval_ttis),
         "total_cell_tput": float(total_cell_tput),
         "total_ue_tput": total_ue_tput,
+        "avg_cell_tput": float(total_cell_tput)/float(eval_ttis),
+        "avg_ue_tput": total_ue_tput/float(eval_ttis),          # tensor [U]
         "alloc_counts": alloc_counts,
         "jain_throughput": float(jain_throughput),
         "pf_utility": float(pf_utility),

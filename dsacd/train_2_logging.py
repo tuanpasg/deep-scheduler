@@ -11,6 +11,8 @@ def init_eval_log():
             "tti": [],
             "total_cell_tput": [],
             "total_ue_tput": [],
+            "avg_cell_tput": [],
+            "avg_ue_tput": [],
             "alloc_counts": [],
             "pf_utility": [],
             "avg_layers_per_rbg": [],
@@ -19,6 +21,8 @@ def init_eval_log():
             "tti": [],
             "total_cell_tput": [],
             "total_ue_tput": [],
+            "avg_cell_tput": [],
+            "avg_ue_tput": [],
             "alloc_counts": [],
             "pf_utility": [],
             "avg_layers_per_rbg": [],
@@ -27,6 +31,8 @@ def init_eval_log():
             "tti": [],
             "total_cell_tput": [],
             "total_ue_tput": [],
+            "avg_cell_tput": [],
+            "avg_ue_tput": [],
             "alloc_counts": [],
             "pf_utility": [],
             "avg_layers_per_rbg": [],
@@ -48,6 +54,8 @@ def append_eval(eval_log: dict, mode: str, tti: int, metrics: dict):
     log["tti"].append(int(tti))
     log["total_cell_tput"].append(float(metrics["total_cell_tput"]))
     log["total_ue_tput"].append([float(x) for x in metrics["total_ue_tput"].tolist()])
+    log["avg_cell_tput"].append(float(metrics["avg_cell_tput"]))
+    log["avg_ue_tput"].append([float(x) for x in metrics["avg_ue_tput"].tolist()])
     log["alloc_counts"].append([float(x) for x in metrics["alloc_counts"].tolist()])
     log["pf_utility"].append(float(metrics["pf_utility"]))
     log["avg_layers_per_rbg"].append(float(metrics["avg_layers_per_rbg"]))
@@ -62,13 +70,13 @@ def plot_eval(mode: str, log: dict, out_path: str):
 
     # total_cell_tput + total_ue_tput (per-UE) in the same subplot
     ax = axs[0, 0]
-    ax.plot(t, log["total_cell_tput"], label="total_cell_tput", linewidth=2)
-    ue_tput = log["total_ue_tput"]
+    ax.plot(t, log["avg_cell_tput"], label="avg_cell_tput", linewidth=2)
+    ue_tput = log["avg_ue_tput"]
     if ue_tput:
         n_ue = len(ue_tput[0])
         for u in range(n_ue):
             series = [row[u] for row in ue_tput]
-            ax.plot(t, series, label=f"ue{u}_tput", alpha=0.6)
+            ax.plot(t, series, label=f"avg_ue{u}_tput", alpha=0.6)
     ax.set_title("Cell + UE throughput")
     ax.set_xlabel("TTI")
     ax.set_ylabel("Throughput")
