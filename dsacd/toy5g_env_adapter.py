@@ -95,7 +95,7 @@ class DeterministicToy5GEnvAdapter:
 
         self.act_dim = self.max_sched_ue + 1
         self.obs_dim = (5+2*self.n_rbg)*self.max_sched_ue
-        
+
         self.device = torch.device(device)
 
         self.max_mcs = 28  # max MCS index (0..28)
@@ -411,7 +411,7 @@ class DeterministicToy5GEnvAdapter:
     def _compute_layer_transitions(self, layer: int, obs: torch.Tensor, masks: torch.Tensor) -> List[Dict]:
         
         # Calculating reward for current layer
-        rewards_m, _ = self.new_reward_compute(self, layer, masks)
+        rewards_m, _ = self.new_reward_compute(layer, masks)
         
         # Generating next observations
         if(self.internal_log):
@@ -473,7 +473,7 @@ class DeterministicToy5GEnvAdapter:
                     if u_prev != noop:
                         prev_alloc.append(u_prev)
 
-            T_prev = self.compute_set_tput(self, prev_alloc, m)
+            T_prev = self.compute_set_tput(prev_alloc, m)
 
             # ---------- compute raw rewards for all candidates ----------
             chosen = int(self._alloc[layer, m].item())
@@ -487,7 +487,7 @@ class DeterministicToy5GEnvAdapter:
                     continue
 
                 curr_alloc = prev_alloc + [u]
-                T_cur = self.compute_set_tput(self, curr_alloc, m)
+                T_cur = self.compute_set_tput(curr_alloc, m)
 
                 if u == chosen:
                     set_tp_per_rbg[m] = T_cur
