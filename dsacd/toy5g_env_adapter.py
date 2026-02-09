@@ -215,7 +215,7 @@ class DeterministicToy5GEnvAdapter:
             ue_id = self.selected_ues[u]
             if (u==self._alloc).any():
                 self.ue_priority[ue_id]=0
-                allocated_ue.append(ue_id)
+                allocated_ue.append(int(ue_id))
         unscheduled_mask = torch.full((self.n_ue,),True, device=self.device, dtype=torch.bool)
         unscheduled_mask[allocated_ue] = False
   
@@ -409,7 +409,7 @@ class DeterministicToy5GEnvAdapter:
     def _compute_layer_transitions(self, layer: int, obs: torch.Tensor, masks: torch.Tensor) -> List[Dict]:
         
         # Calculating reward for current layer
-        rewards_m, _ = new_reward_compute(self, layer, masks)
+        rewards_m, _ = self.new_reward_compute(self, layer, masks)
         
         # Generating next observations
         if(self.internal_log):
@@ -432,84 +432,84 @@ class DeterministicToy5GEnvAdapter:
             self._last_transitions.append(out[-1])
         return out
     
-def compute_set_tput(self, alloc_set, m):
-    if len(alloc_set) == 0:
-        return 0.0
+    def compute_set_tput(self, alloc_set, m):
+        if len(alloc_set) == 0:
+            return 0.0
 
-    max_corr = 0.0
-    for i in range(len(alloc_set) - 1):
-        u = alloc_set[i]
-        for j in range(i + 1, len(alloc_set)):
-            v = alloc_set[j]
-            max_corr = max(
-                max_corr,
-                float(self.max_cross_corr[self.selected_ues[u], self.selected_ues[v], m].item())
-            )
+        max_corr = 0.0
+        for i in range(len(alloc_set) - 1):
+            u = alloc_set[i]
+            for j in range(i + 1, len(alloc_set)):
+                v = alloc_set[j]
+                max_corr = max(
+                    max_corr,
+                    float(self.max_cross_corr[self.selected_ues[u], self.selected_ues[v], m].item())
+                )
 
-    penalty = (1.0 - max_corr) / max(len(alloc_set), 1)
+        penalty = (1.0 - max_corr) / max(len(alloc_set), 1)
 
-    tput = 0.0
-    for u in alloc_set:
-        if self.selected_buf[u] > 0:
-            tput += float(self._rate_mbps(self.selected_ues[u], m).item())
+        tput = 0.0
+        for u in alloc_set:
+            if self.selected_buf[u] > 0:
+                tput += float(self._rate_mbps(self.selected_ues[u], m).item())
 
-    return tput * penalty
+        return tput * penalty
 
-def new_reward_compute(self, layer: int, masks: torch.Tensor):
-    rewards_m = torch.zeros((self.n_rbg,), device=self.device)
-    set_tp_per_rbg = torch.zeros((self.n_rbg,), device=self.device)
-    noop = self.noop
+    def new_reward_compute(self, layer: int, masks: torch.Tensor):
+        rewards_m = torch.zeros((self.n_rbg,), device=self.device)
+        set_tp_per_rbg = torch.zeros((self.n_rbg,), device=self.device)
+        noop = self.noop
 
-    Ru_all = self.selected_buf.clone()
+        Ru_all = self.selected_buf.clone()
 
-    for m in range(self.n_rbg):
-        # ---------- previous set ----------
-        prev_alloc = []
-        if layer > 0:
-            for l_prev in range(layer):
-                u_prev = int(self._alloc[l_prev, m].item())
-                if u_prev != noop:
-                    prev_alloc.append(u_prev)
+        for m in range(self.n_rbg):
+            # ---------- previous set ----------
+            prev_alloc = []
+            if layer > 0:
+                for l_prev in range(layer):
+                    u_prev = int(self._alloc[l_prev, m].item())
+                    if u_prev != noop:
+                        prev_alloc.append(u_prev)
 
-        T_prev = compute_set_tput(self, prev_alloc, m)
+            T_prev = self.compute_set_tput(self, prev_alloc, m)
 
-        # ---------- compute raw rewards for all candidates ----------
-        chosen = int(self._alloc[layer, m].item())
-        if chosen == noop:
-            set_tp_per_rbg[m] = T_prev
-
-        raw_all = torch.zeros((self.max_sched_ue,), device=self.device)
-
-        for u in range(self.max_sched_ue):
-            if not masks[m, u] or self.selected_buf[u] <= 0:
-                continue
-
-            curr_alloc = prev_alloc + [u]
-            T_cur = compute_set_tput(self, curr_alloc, m)
-
-            if u == chosen:
-                set_tp_per_rbg[m] = T_cur
-
-            raw_all[u] = (T_cur - T_prev) / float(Ru_all[u].item())
-
-        # ---------- normalization (Eq. 21) ----------
-        max_raw = torch.max(raw_all)
-
-        if max_raw > 0.0:
+            # ---------- compute raw rewards for all candidates ----------
+            chosen = int(self._alloc[layer, m].item())
             if chosen == noop:
-                rewards_m[m] = 0.0
-            else:
-                rewards_m[m] = torch.clamp(raw_all[chosen] / max_raw, -1.0, 1.0)
-        elif max_raw < 0.0:
-            # all UE choices reduce throughput → noop is optimal
-            rewards_m[m] = 1.0 if chosen == noop else -1.0
-        else:
-            rewards_m[m] = 0.0
+                set_tp_per_rbg[m] = T_prev
 
-        if self.internal_log:
-            print(f"Computing reward for rgb {m} ....")
-            print(f"prev_alloc={prev_alloc}, T_prev={T_prev}")
-            print(f"chosen={chosen}, T_cur={set_tp_per_rbg[m]}")
-            print(f"raw_all={raw_all}")
-            print(f"rewards_m={rewards_m}")
-    return rewards_m, set_tp_per_rbg
+            raw_all = torch.zeros((self.max_sched_ue,), device=self.device)
+
+            for u in range(self.max_sched_ue):
+                if not masks[m, u] or self.selected_buf[u] <= 0:
+                    continue
+
+                curr_alloc = prev_alloc + [u]
+                T_cur = self.compute_set_tput(self, curr_alloc, m)
+
+                if u == chosen:
+                    set_tp_per_rbg[m] = T_cur
+
+                raw_all[u] = (T_cur - T_prev) / float(Ru_all[u].item())
+
+            # ---------- normalization (Eq. 21) ----------
+            max_raw = torch.max(raw_all)
+
+            if max_raw > 0.0:
+                if chosen == noop:
+                    rewards_m[m] = 0.0
+                else:
+                    rewards_m[m] = torch.clamp(raw_all[chosen] / max_raw, -1.0, 1.0)
+            elif max_raw < 0.0:
+                # all UE choices reduce throughput → noop is optimal
+                rewards_m[m] = 1.0 if chosen == noop else -1.0
+            else:
+                rewards_m[m] = 0.0
+
+            if self.internal_log:
+                print(f"Computing reward for rgb {m} ....")
+                print(f"prev_alloc={prev_alloc}, T_prev={T_prev}")
+                print(f"chosen={chosen}, T_cur={set_tp_per_rbg[m]}")
+                print(f"raw_all={raw_all}")
+                print(f"rewards_m={rewards_m}")
+        return rewards_m, set_tp_per_rbg

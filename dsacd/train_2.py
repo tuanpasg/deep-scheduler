@@ -396,6 +396,10 @@ def main(args):
         seed=args.seed,
     )
 
+    # Update args dimensions to match environment internals
+    args.obs_dim = env.obs_dim
+    args.act_dim = env.act_dim
+
     eval_env = DeterministicToy5GEnvAdapter(
         obs_dim=args.obs_dim,
         act_dim=args.act_dim,
