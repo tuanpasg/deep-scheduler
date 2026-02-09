@@ -118,7 +118,7 @@ def evaluate_scheduler_metrics(
         if not hasattr(eval_env, "_curr_mcs"):
             eval_env._sample_mcs()
         mcs = np.asarray(eval_env._curr_mcs, dtype=int)
-        buf_tmp = eval_env.buf.detach().cpu().clone() + float(eval_env.buf_arrival)
+        # buf_tmp = eval_env.buf.detach().cpu().clone() + float(eval_env.buf_arrival)
         duration_s = eval_env.tti_ms / 1000.0
 
         # pairing metric per RBG
@@ -155,8 +155,11 @@ def evaluate_scheduler_metrics(
                     n_symb=int(eval_env.n_symb),
                     overhead_re_per_prb=int(eval_env.overhead),
                 )
-                served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
-                buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
+
+                # In full buffer traffic mode, the served bytes will be not contrained by the buffer size
+                served = float(tbs)*penalty
+                # served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
+                # buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
                 ue_tti[u] += float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
                 alloc_counts[u] += 1.0
             layers_per_rbg_sum += float(scheduled_layers_rbg)
@@ -167,20 +170,23 @@ def evaluate_scheduler_metrics(
 
         eval_env.finish_tti()
 
+    avg_cell_tput = float(total_cell_tput)/float(eval_ttis)
+    avg_ue_tput = total_ue_tput/float(eval_ttis)
+
     invalid_action_rate = invalid / max(decisions, 1)
     no_schedule_rate = nosched / max(decisions, 1)
     avg_layers_per_rbg = layers_per_rbg_sum / max(layers_per_rbg_den, 1)
 
     jain_throughput = _jain_fairness(total_ue_tput)
-    pf_utility = float(torch.log((total_ue_tput / max(eval_ttis, 1)) + eps).sum().item())
+    pf_utility = float(torch.log((avg_ue_tput / max(eval_ttis, 1)) + eps).sum().item())
 
     return {
         "mode": mode,
         "eval_ttis": int(eval_ttis),
         "total_cell_tput": float(total_cell_tput),
         "total_ue_tput": total_ue_tput,          # tensor [U]
-        "avg_cell_tput": float(total_cell_tput)/float(eval_ttis),
-        "avg_ue_tput": total_ue_tput/float(eval_ttis),          # tensor [U]
+        "avg_cell_tput": avg_cell_tput,
+        "avg_ue_tput": avg_ue_tput,          # tensor [U]
         "alloc_counts": alloc_counts,            # tensor [U]
         "jain_throughput": float(jain_throughput),
         "pf_utility": float(pf_utility),
@@ -249,7 +255,7 @@ def evaluate_random_scheduler_metrics(
         if not hasattr(eval_env, "_curr_mcs"):
             eval_env._sample_mcs()
         mcs = np.asarray(eval_env._curr_mcs, dtype=int)
-        buf_tmp = eval_env.buf.detach().cpu().clone() + float(eval_env.buf_arrival)
+        # buf_tmp = eval_env.buf.detach().cpu().clone() + float(eval_env.buf_arrival)
         duration_s = eval_env.tti_ms / 1000.0
 
         for m in range(M):
@@ -285,8 +291,11 @@ def evaluate_random_scheduler_metrics(
                     n_symb=int(eval_env.n_symb),
                     overhead_re_per_prb=int(eval_env.overhead),
                 )
-                served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
-                buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
+
+                # In full buffer traffic mode, the served bytes will be not contrained by the buffer size
+                served = float(tbs)*penalty
+                # served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
+                # buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
                 ue_tti[u] += float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
                 alloc_counts[u] += 1.0
 
@@ -298,20 +307,23 @@ def evaluate_random_scheduler_metrics(
 
         eval_env.finish_tti()
 
+    avg_cell_tput = float(total_cell_tput)/float(eval_ttis)
+    avg_ue_tput = total_ue_tput/float(eval_ttis)
+
     invalid_action_rate = invalid / max(decisions, 1)
     no_schedule_rate = nosched / max(decisions, 1)
     avg_layers_per_rbg = layers_per_rbg_sum / max(layers_per_rbg_den, 1)
 
     jain_throughput = _jain_fairness(total_ue_tput)
-    pf_utility = float(torch.log((total_ue_tput / max(eval_ttis, 1)) + eps).sum().item())
+    pf_utility = float(torch.log((avg_ue_tput / max(eval_ttis, 1)) + eps).sum().item())
 
     return {
         "mode": "random",
         "eval_ttis": int(eval_ttis),
         "total_cell_tput": float(total_cell_tput),
         "total_ue_tput": total_ue_tput,
-        "avg_cell_tput": float(total_cell_tput)/float(eval_ttis),
-        "avg_ue_tput": total_ue_tput/float(eval_ttis),          # tensor [U]
+        "avg_cell_tput": avg_cell_tput,
+        "avg_ue_tput": avg_ue_tput,
         "alloc_counts": alloc_counts,
         "jain_throughput": float(jain_throughput),
         "pf_utility": float(pf_utility),
@@ -522,19 +534,19 @@ def main(args):
             append_eval(eval_log, "random", tti, m_rand)
 
             msg += (
-                f" \nSAMPLE cell_tput={m_sample['total_cell_tput']:.2f}"
+                f" \nSAMPLE cell_tput={m_sample['avg_cell_tput[Mbps]']:.2f}"
                 f" jain={m_sample['jain_throughput']:.3f}"
                 f" pfU={m_sample['pf_utility']:.2f}"
                 f" inv={m_sample['invalid_action_rate']:.3f}"
                 f" noop={m_sample['no_schedule_rate']:.3f}"
                 f" layers/RBG={m_sample['avg_layers_per_rbg']:.2f}"
-                f" \nGREEDY cell_tput={m_greedy['total_cell_tput']:.2f}"
+                f" \nGREEDY cell_tput={m_greedy['avg_cell_tput[Mbps]']:.2f}"
                 f" jain={m_greedy['jain_throughput']:.3f}"
                 f" pfU={m_greedy['pf_utility']:.2f}"
                 f" inv={m_greedy['invalid_action_rate']:.3f}"
                 f" noop={m_greedy['no_schedule_rate']:.3f}"
                 f" layers/RBG={m_greedy['avg_layers_per_rbg']:.2f}"
-                f" \nRANDOM cell_tput={m_rand['total_cell_tput']:.2f}"
+                f" \nRANDOM cell_tput={m_rand['avg_cell_tput[Mbps]']:.2f}"
                 f" jain={m_rand['jain_throughput']:.3f}"
                 f" pfU={m_rand['pf_utility']:.2f}"
                 f" inv={m_rand['invalid_action_rate']:.3f}"

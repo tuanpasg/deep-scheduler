@@ -75,7 +75,7 @@ class DeterministicToy5GEnvAdapter:
         seed: int = 0,
         device: str = "cpu",
         # PF/throughput params
-        ema_beta: float = 0.98,
+        ema_beta: float = 0.9,
         eps: float = 1e-6,
         # deterministic traffic/channel knobs
         buf_init: int = 50_000,
@@ -137,6 +137,10 @@ class DeterministicToy5GEnvAdapter:
         self.internal_log = internal_log
 
         self.max_cross_corr = np.random.rand(self.n_ue, self.n_ue, self.n_rbg)
+        self.max_cross_corr = (self.max_cross_corr + self.max_cross_corr.transpose(1, 0, 2)) / 2
+        ue_indices = np.arange(self.n_ue)
+        self.max_cross_corr[ue_indices, ue_indices, :] = 1
+        
         self._sample_mcs()
 
     # ---------- Public API ----------
@@ -201,6 +205,45 @@ class DeterministicToy5GEnvAdapter:
     def finish_tti(self):
         self.t += 1
 
+    def user_rate_under_sinr(self):
+        alloc = self._alloc.detach().cpu().numpy()
+        noop = self.noop
+        served_bytes_ue_tti = np.zeros((self.n_ue,), dtype=np.float32)
+        duration_s = self.tti_ms / 1000.0
+        buf_tmp = self.buf.clone()
+
+        for m in range(self.n_rbg):
+            # Get all unique UEs scheduled on this RBG, ignoring NOOPs.
+            scheduled_ues_on_rbg = sorted(list(set(u for u in alloc[:, m].tolist() if u != noop)))
+
+            # Find the maximum cross-correlation between any pair of UEs on this RBG
+            max_cross_corr_rbg = 0.0
+            if len(scheduled_ues_on_rbg) > 1:
+                corrs = []
+                for i in range(len(scheduled_ues_on_rbg)):
+                    for j in range(i + 1, len(scheduled_ues_on_rbg)):
+                        u1 = scheduled_ues_on_rbg[i]
+                        u2 = scheduled_ues_on_rbg[j]
+                        corrs.append(self.max_cross_corr[u1, u2, m])
+                if corrs:
+                    max_cross_corr_rbg = max(corrs)
+
+            # Model the SINR effect with a penalty
+            penalty = 1.0 - max_cross_corr_rbg
+
+            for l in range(self.n_layers):
+                u = int(alloc[l, m].item())
+                if u == noop:
+                    continue
+                tbs = self._served_bytes(u, m)
+                effective_tbs = float(tbs) * penalty
+                served = min(float(buf_tmp[u].item()), float(effective_tbs))
+                buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
+                served_bytes_ue_tti[u] += served
+
+        rate_ue = (served_bytes_ue_tti * 8.0) / 1e6 / max(duration_s, 1e-9)
+        return torch.from_numpy(rate_ue).to(self.device), buf_tmp
+
     # ---------- Internals ----------
     def _served_bytes(self, ue: int, m: int) -> torch.Tensor:
         if not hasattr(self, "_curr_mcs"):
@@ -225,16 +268,7 @@ class DeterministicToy5GEnvAdapter:
         # We check: count(allocs in previous layers) < ue_rank
         # Note: This counts spatial layers per RBG. Allocating multiple RBGs on the same layer
         #       does NOT increase the rank count (it counts as 1 layer for those RBGs).
-        # if layer > 0:
-        #     # prev_alloc: [layer, M]
-        #     prev_alloc = self._alloc[:layer, :]
-        #     # Count occurrences: [M, U]
-        #     u_indices = torch.arange(self.n_ue, device=self.device).view(1, 1, -1)
-        #     matches = (prev_alloc.unsqueeze(-1) == u_indices)
-        #     counts = matches.sum(dim=0)  # [M, U]
-        #     rank_ok = (counts < self.ue_rank.unsqueeze(0))  # [M, U]
-        #     valid_ue = valid_ue & rank_ok
-
+  
         if layer > 0:
             # 1. Rank Check (Same as before)
             prev_allocs = self._alloc[:layer, :]
@@ -357,98 +391,100 @@ class DeterministicToy5GEnvAdapter:
         # reward computed after finishing layer allocation (across all RBGs)
         # 1) compute instantaneous per-UE throughput for *this layer only* and accumulate
         #    Use actually served amount (cap by remaining buffer).
-        tp_layer = torch.zeros((self.n_ue,), device=self.device)
-        served_layer = torch.zeros((self.n_ue,), device=self.device)
-        served_rbg = torch.zeros((self.n_rbg,), device=self.device)
-        buf_tmp = self.buf.clone()
-        for m in range(self.n_rbg):
-            ue = int(self._alloc[layer, m].item())
-            if ue == self.noop:
-                continue
-            if buf_tmp[ue] <= 0:
-                continue  # should be masked but keep safe
-            served = self._served_bytes(ue,m)
-            served = torch.minimum(buf_tmp[ue], served)
-            served_rbg[m] = served
-            buf_tmp[ue] = torch.clamp(buf_tmp[ue] - served, min=0.0)
-            served_layer[ue] += served
+        # tp_layer = torch.zeros((self.n_ue,), device=self.device)
+        # served_layer = torch.zeros((self.n_ue,), device=self.device)
+        # served_rbg = torch.zeros((self.n_rbg,), device=self.device)
+        # buf_tmp = self.buf.clone()
+        # for m in range(self.n_rbg):
+        #     ue = int(self._alloc[layer, m].item())
+        #     if ue == self.noop:
+        #         continue
+        #     if buf_tmp[ue] <= 0:
+        #         continue  # should be masked but keep safe
+        #     served = self._served_bytes(ue,m)
+        #     served = torch.minimum(buf_tmp[ue], served)
+        #     served_rbg[m] = served
+        #     buf_tmp[ue] = torch.clamp(buf_tmp[ue] - served, min=0.0)
+        #     served_layer[ue] += served
         
-        duration_s = self.tti_ms / 1000.0
-        tp_layer = (served_layer * 8.0) / 1e6 / max(duration_s, 1e-9)
+        # duration_s = self.tti_ms / 1000.0
+        # tp_layer = (served_layer * 8.0) / 1e6 / max(duration_s, 1e-9)
 
         # 2) update EMA throughput using this layer contribution (paper says reward after each layer iteration)
-        self.avg_tp = self.ema_beta * self.avg_tp + (1.0 - self.ema_beta) * tp_layer
+        # self.avg_tp = self.ema_beta * self.avg_tp + (1.0 - self.ema_beta) * tp_layer
 
         # 3) Off-policy DSACD reward (paper Appendix D.4, Eq.20-21)
-        avg_tp_before_tti = self._avg_tp_before_tti if self._avg_tp_before_tti is not None else self.avg_tp
-        rewards_m = torch.empty((self.n_rbg,), device=self.device)
+        # avg_tp_before_tti = self._avg_tp_before_tti if self._avg_tp_before_tti is not None else self.avg_tp
+        # rewards_m = torch.empty((self.n_rbg,), device=self.device)
+        # for m in range(self.n_rbg):
+        #     chosen = int(self._alloc[layer, m].item())
 
-        for m in range(self.n_rbg):
-            chosen = int(self._alloc[layer, m].item())
+        #     # Identify UEs scheduled in previous layers on this RBG
+        #     scheduled_ues = []
+        #     if layer > 0:
+        #         prev_alloc = self._alloc[:layer, m]
+        #         for l_prev in range(layer):
+        #             u_prev = int(prev_alloc[l_prev].item())
+        #             if u_prev != self.noop:
+        #                 scheduled_ues.append(u_prev)
 
-            # Identify UEs scheduled in previous layers on this RBG
-            scheduled_ues = []
-            if layer > 0:
-                prev_alloc = self._alloc[:layer, m]
-                for l_prev in range(layer):
-                    u_prev = int(prev_alloc[l_prev].item())
-                    if u_prev != self.noop:
-                        scheduled_ues.append(u_prev)
+        #     raw_all = torch.empty((self.n_ue,), device=self.device, dtype=torch.float32)
+        #     for u in range(self.n_ue):
+        #         if self.buf[u] <= 0:
+        #             raw_all[u] = 0.0
+        #             continue
 
-            raw_all = torch.empty((self.n_ue,), device=self.device, dtype=torch.float32)
-            for u in range(self.n_ue):
-                if self.buf[u] <= 0:
-                    raw_all[u] = 0.0
-                    continue
+        #         Ru = float((avg_tp_before_tti[u] + self.eps).item())
+        #         Tu = float(self._rate_mbps(u,m).item())
 
-                Ru = float((avg_tp_before_tti[u] + self.eps).item())
-                Tu = float(self._rate_mbps(u,m).item())
-
-                # Apply spatial interference penalty: Tu *= (1 - max_cross_corr)
-                penalty = 0.0
-                if len(scheduled_ues) > 0:
-                    # max_cross_corr is [U, U, M]. Get max corr with any scheduled UE on this RBG.
-                    corrs = [self.max_cross_corr[u, v, m] for v in scheduled_ues]
-                    penalty = max(corrs)
+        #         # Apply spatial interference penalty: Tu *= (1 - max_cross_corr)
+        #         penalty = 0.0
+        #         if len(scheduled_ues) > 0:
+        #             # max_cross_corr is [U, U, M]. Get max corr with any scheduled UE on this RBG.
+        #             corrs = [self.max_cross_corr[u, v, m] for v in scheduled_ues]
+        #             penalty = max(corrs)
                 
-                Tu = Tu * (1.0 - penalty)
+        #         Tu = Tu * (1.0 - penalty)
 
-                if layer == 0:
-                    raw_all[u] = Tu / Ru
-                else:
-                    prev = int(self._alloc[layer - 1, m].item())
-                    Tu_prev = Tu if (prev == u) else 0.0
-                    raw_all[u] = (Tu / Ru) - (Tu_prev / Ru)
+        #         if layer == 0:
+        #             raw_all[u] = Tu / Ru
+        #         else:
+        #             prev = int(self._alloc[layer - 1, m].item())
+        #             Tu_prev = Tu if (prev == u) else 0.0
+        #             raw_all[u] = (Tu / Ru) - (Tu_prev / Ru)
 
-            max_raw = float(raw_all.max().item()) if raw_all.numel() > 0 else 0.0
+        #     max_raw = float(raw_all.max().item()) if raw_all.numel() > 0 else 0.0
 
-            if max_raw > 0.0:
-                if chosen == self.noop:
-                    rewards_m[m] = 0.0
-                else:
-                    u = int(chosen)
-                    # chosen might be invalid if buf==0; keep safe
-                    if u < 0 or u >= self.n_ue or self.buf[u] <= 0:
-                        rewards_m[m] = 0.0
-                    else:
-                        raw = float(raw_all[u].item())
-                        rewards_m[m] = max(raw / max_raw, -1.0)
-            elif max_raw < 0.0:
-                rewards_m[m] = 1.0 if (chosen == self.noop) else -1.0
-            else:
-                rewards_m[m] = 0.0
+        #     if max_raw > 0.0:
+        #         if chosen == self.noop:
+        #             rewards_m[m] = 0.0
+        #         else:
+        #             u = int(chosen)
+        #             # chosen might be invalid if buf==0; keep safe
+        #             if u < 0 or u >= self.n_ue or self.buf[u] <= 0:
+        #                 rewards_m[m] = 0.0
+        #             else:
+        #                 raw = float(raw_all[u].item())
+        #                 rewards_m[m] = max(raw / max_raw, -1.0)
+        #     elif max_raw < 0.0:
+        #         rewards_m[m] = 1.0 if (chosen == self.noop) else -1.0
+        #     else:
+        #         rewards_m[m] = 0.0
 
-        if(self.internal_log):
-          print("Appling actions on environment ....")
-          print(f"served_rbg:{served_rbg}\nserved_layer:{served_layer}")
-          print(f"Rewards:{rewards_m}")
+        rewards_m, _ = new_reward_compute(self, layer, masks)
+        
+        # if(self.internal_log):
+        #   print("Appling actions on environment ....")
+        #   print(f"served_rbg:{served_rbg}\nserved_layer:{served_layer}")
+        #   print(f"Rewards:{rewards_m}")
+
         # 5) Apply service (drain buffers) for this layer after reward computation
-        for m in range(self.n_rbg):
-            ue = int(self._alloc[layer, m].item())
-            if ue == self.noop:
-                continue
-            served = served_rbg[m]
-            self.buf[ue] = torch.clamp(self.buf[ue] - served, min=0.0)
+        # for m in range(self.n_rbg):
+        #     ue = int(self._alloc[layer, m].item())
+        #     if ue == self.noop:
+        #         continue
+        #     served = served_rbg[m]
+        #     self.buf[ue] = torch.clamp(self.buf[ue] - served, min=0.0)
 
         # next state after this layer
         if(self.internal_log):
@@ -456,6 +492,15 @@ class DeterministicToy5GEnvAdapter:
         next_layer_idx = min(layer + 1, self.n_layers - 1)
         next_masks = self._build_masks(layer=next_layer_idx)
         next_obs = self._build_obs(layer=next_layer_idx)
+
+        # Update USER_THROUGHPUT and BUFFER STATUS at the END OF TTI
+        if layer == self.n_layers - 1:
+
+            user_tp, remained_buf = self.user_rate_under_sinr()
+            self.avg_tp = self.ema_beta * self.avg_tp + (1.0 - self.ema_beta) * user_tp
+
+            # Update buffer after service
+            self.buf = remained_buf
 
         out = []
         for m in range(self.n_rbg):
@@ -470,3 +515,80 @@ class DeterministicToy5GEnvAdapter:
             })
             self._last_transitions.append(out[-1])
         return out
+    
+def compute_set_tput(self, alloc_set, m):
+    if len(alloc_set) == 0:
+        return 0.0
+
+    max_corr = 0.0
+    for i in range(len(alloc_set) - 1):
+        u = alloc_set[i]
+        for j in range(i + 1, len(alloc_set)):
+            v = alloc_set[j]
+            max_corr = max(
+                max_corr,
+                float(self.max_cross_corr[u, v, m].item())
+            )
+
+    penalty = (1.0 - max_corr) / max(len(alloc_set), 1)
+
+    tput = 0.0
+    for u in alloc_set:
+        if self.buf[u] > 0:
+            tput += float(self._rate_mbps(u, m).item())
+
+    return tput * penalty    
+
+def new_reward_compute(self, layer: int, masks: torch.Tensor):
+    rewards_m = torch.zeros((self.n_rbg,), device=self.device)
+    set_tp_per_rbg = torch.zeros((self.n_rbg,), device=self.device)
+    noop = self.noop
+    U = self.n_ue
+
+    Ru_all = self.avg_tp_before_tti  # [U]
+
+    for m in range(self.n_rbg):
+        # ---------- previous set ----------
+        prev_alloc = []
+        if layer > 0:
+            for l_prev in range(layer):
+                u_prev = int(self._alloc[l_prev, m].item())
+                if u_prev != noop:
+                    prev_alloc.append(u_prev)
+
+        T_prev = compute_set_tput(self, prev_alloc, m)
+
+        # ---------- compute raw rewards for all candidates ----------
+        chosen = int(self._alloc[layer, m].item())
+        if chosen == noop:
+            set_tp_per_rbg[m] = T_prev
+
+        raw_all = torch.zeros((U,), device=self.device)
+
+        for u in range(U):
+            if not masks[m, u] or self.buf[u] <= 0:
+                continue
+
+            curr_alloc = prev_alloc + [u]
+            T_cur = compute_set_tput(self, curr_alloc, m)
+
+            if u == chosen:
+                set_tp_per_rbg[m] = T_cur
+
+            raw_all[u] = (T_cur - T_prev) / float(Ru_all[u].item())
+
+        # ---------- normalization (Eq. 21) ----------
+        max_raw = torch.max(raw_all)
+
+        if max_raw > 0.0:
+            if chosen == noop:
+                rewards_m[m] = 0.0
+            else:
+                rewards_m[m] = torch.clamp(raw_all[chosen] / max_raw, -1.0, 1.0)
+
+        elif max_raw < 0.0:
+            # all UE choices reduce throughput → noop is optimal
+            rewards_m[m] = 1.0 if chosen == noop else -1.0
+        else:
+            rewards_m[m] = 0.0
+    return rewards_m, set_tp_per_rbg
