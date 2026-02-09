@@ -26,7 +26,7 @@ from train_2_logging import (
     plot_training,
     save_logs,
     plot_allocation,
-)
+    plot_tput)
 
 
 def _jain_fairness(x: torch.Tensor, eps: float = 1e-12) -> float:
@@ -149,13 +149,7 @@ def evaluate_scheduler_metrics(
                 u = int(alloc[l, m].item())
                 if u == noop:
                     continue
-                tbs = tbs_38214_bytes(
-                    int(mcs[u]),
-                    int(eval_env.prbs_per_rbg),
-                    n_symb=int(eval_env.n_symb),
-                    overhead_re_per_prb=int(eval_env.overhead),
-                )
-
+                tbs = eval_env._served_bytes(u,m)
                 # In full buffer traffic mode, the served bytes will be not contrained by the buffer size
                 served = float(tbs)*penalty
                 # served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
@@ -178,8 +172,9 @@ def evaluate_scheduler_metrics(
     avg_layers_per_rbg = layers_per_rbg_sum / max(layers_per_rbg_den, 1)
 
     jain_throughput = _jain_fairness(total_ue_tput)
-    pf_utility = float(torch.log((avg_ue_tput / max(eval_ttis, 1)) + eps).sum().item())
+    pf_utility = float(torch.log((avg_ue_tput) + eps).sum().item())
 
+    alloc_counts_per_tti = alloc_counts / eval_ttis
     return {
         "mode": mode,
         "eval_ttis": int(eval_ttis),
@@ -187,7 +182,7 @@ def evaluate_scheduler_metrics(
         "total_ue_tput": total_ue_tput,          # tensor [U]
         "avg_cell_tput": avg_cell_tput,
         "avg_ue_tput": avg_ue_tput,          # tensor [U]
-        "alloc_counts": alloc_counts,            # tensor [U]
+        "alloc_counts": alloc_counts_per_tti,            # tensor [U]
         "jain_throughput": float(jain_throughput),
         "pf_utility": float(pf_utility),
         "invalid_action_rate": float(invalid_action_rate),
@@ -285,13 +280,7 @@ def evaluate_random_scheduler_metrics(
                 u = int(alloc[l, m].item())
                 if u == noop:
                     continue
-                tbs = tbs_38214_bytes(
-                    int(mcs[u]),
-                    int(eval_env.prbs_per_rbg),
-                    n_symb=int(eval_env.n_symb),
-                    overhead_re_per_prb=int(eval_env.overhead),
-                )
-
+                tbs = eval_env._served_bytes(u,m)
                 # In full buffer traffic mode, the served bytes will be not contrained by the buffer size
                 served = float(tbs)*penalty
                 # served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
@@ -315,15 +304,16 @@ def evaluate_random_scheduler_metrics(
     avg_layers_per_rbg = layers_per_rbg_sum / max(layers_per_rbg_den, 1)
 
     jain_throughput = _jain_fairness(total_ue_tput)
-    pf_utility = float(torch.log((avg_ue_tput / max(eval_ttis, 1)) + eps).sum().item())
-
+    pf_utility = float(torch.log((avg_ue_tput) + eps).sum().item())
+    
+    alloc_counts_per_tti = alloc_counts / eval_ttis
     return {
         "mode": "random",
         "eval_ttis": int(eval_ttis),
         "total_cell_tput": float(total_cell_tput),
         "total_ue_tput": total_ue_tput,
         "avg_cell_tput": avg_cell_tput,
-        "avg_ue_tput": avg_ue_tput,
+        "avg_ue_tput": alloc_counts_per_tti,
         "alloc_counts": alloc_counts,
         "jain_throughput": float(jain_throughput),
         "pf_utility": float(pf_utility),
@@ -559,6 +549,11 @@ def main(args):
     plot_eval("sample", eval_log["sample"], os.path.join(args.out_dir, "performance_with_sampling.png"))
     plot_eval("greedy", eval_log["greedy"], os.path.join(args.out_dir, "performance_with_greedy.png"))
     plot_eval("random", eval_log["random"], os.path.join(args.out_dir, "performance_with_random.png"))
+    plot_tput("random",eval_log["random"]["avg_cell_tput"],
+            "greedy",eval_log["greedy"]["avg_cell_tput"],
+            "sample",eval_log["sample"]["avg_cell_tput"],
+            eval_log["random"]["tti"],
+            os.path.join(args.out_dir, "throughput_comparison.png"))
     plot_training(train_log, os.path.join(args.out_dir, "training_behavior.png"))
 
 if __name__ == "__main__":

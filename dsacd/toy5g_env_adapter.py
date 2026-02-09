@@ -585,14 +585,13 @@ def new_reward_compute(self, layer: int, masks: torch.Tensor):
                 rewards_m[m] = 0.0
             else:
                 rewards_m[m] = torch.clamp(raw_all[chosen] / max_raw, -1.0, 1.0)
-
         elif max_raw < 0.0:
             # all UE choices reduce throughput → noop is optimal
             rewards_m[m] = 1.0 if chosen == noop else -1.0
         else:
             rewards_m[m] = 0.0
-            
-        if self._internal_log:
+
+        if self.internal_log:
             print(f"Computing reward for rgb {m} ....")
             print(f"prev_alloc={prev_alloc}, T_prev={T_prev}")
             print(f"chosen={chosen}, T_cur={set_tp_per_rbg[m]}")
