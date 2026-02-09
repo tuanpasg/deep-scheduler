@@ -89,11 +89,13 @@ class DeterministicToy5GEnvAdapter:
         assert act_dim >= 2, "Need at least 1 UE + NOOP."
         self.n_ue = 512
         self.max_sched_ue = 10
-        self.act_dim = self.max_sched_ue + 1
-        self.obs_dim = (5+2*self.n_rbg)*self.max_sched_ue
         self.noop = self.max_sched_ue
         self.n_layers = n_layers
         self.n_rbg = n_rbg
+
+        self.act_dim = self.max_sched_ue + 1
+        self.obs_dim = (5+2*self.n_rbg)*self.max_sched_ue
+        
         self.device = torch.device(device)
 
         self.max_mcs = 28  # max MCS index (0..28)
