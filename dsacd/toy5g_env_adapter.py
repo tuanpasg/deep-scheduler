@@ -79,7 +79,7 @@ class DeterministicToy5GEnvAdapter:
         eps: float = 1e-6,
         # deterministic traffic/channel knobs
         buf_init: int = 50_000,
-        buf_arrival: int = 10_000,
+        buf_arrival: int = 50_000,
         tti_ms: float = 1.0,
         prbs_per_rbg: int = 18,
         n_symb: int = 14,
@@ -87,10 +87,11 @@ class DeterministicToy5GEnvAdapter:
         internal_log: bool = False
     ):
         assert act_dim >= 2, "Need at least 1 UE + NOOP."
-        self.obs_dim = obs_dim
-        self.act_dim = act_dim
-        self.n_ue = act_dim - 1
-        self.noop = self.n_ue
+        self.n_ue = 512
+        self.max_sched_ue = 10
+        self.act_dim = self.max_sched_ue + 1
+        self.obs_dim = (5+2*self.n_rbg)*self.max_sched_ue
+        self.noop = self.max_sched_ue
         self.n_layers = n_layers
         self.n_rbg = n_rbg
         self.device = torch.device(device)
@@ -115,13 +116,12 @@ class DeterministicToy5GEnvAdapter:
         self.t = 0
         self.buf = torch.full((self.n_ue,), self.buf_init, device=self.device, dtype=torch.float32)  # bytes
         self.avg_tp = torch.full((self.n_ue,), self.eps, device=self.device, dtype=torch.float32)          # EMA throughput (Mbps)
+        self.ue_priority = torch.full((self.n_ue,), 0, device=self.device, dtype=torch.int)
 
         # Allocation caches (per TTI)
         self._alloc = torch.full((self.n_layers, self.n_rbg), self.noop, device=self.device, dtype=torch.long)
         self._last_transitions: List[Dict] = []
         self._cur_layer: Optional[int] = None
-        self._arrivals_added = False
-        self._avg_tp_before_tti: Optional[torch.Tensor] = None
 
         # Per-UE rank capability (spatial layers supported), max rank = 2
         # self.ue_rank = (1 + (torch.arange(self.n_ue) % 2)).to(self.device).float()
@@ -129,17 +129,18 @@ class DeterministicToy5GEnvAdapter:
 
         # Fading profile: fixed per-UE MCS mean (constant through layers/RBGs)
         self.rng = np.random.default_rng(seed)
-        self.mcs_mean = self.rng.integers(0, self.max_mcs + 1, size=(self.n_ue,))
+        self.mcs_mean = self.rng.integers(5, self.max_mcs + 1, size=(self.n_ue,))
         # self.mcs_mean = np.full((self.n_ue,), 20, dtype=int)
         # self.mcs_mean = np.array([5,10,25,5])
         self.mcs_spread = 1
 
         self.internal_log = internal_log
 
+        # Pseudo cross correlation table
         self.max_cross_corr = np.random.rand(self.n_ue, self.n_ue, self.n_rbg)
         self.max_cross_corr = (self.max_cross_corr + self.max_cross_corr.transpose(1, 0, 2)) / 2
         ue_indices = np.arange(self.n_ue)
-        self.max_cross_corr[ue_indices, ue_indices, :] = 1
+        self.max_cross_corr[ue_indices, ue_indices, :] = 0.9
         
         self._sample_mcs()
 
@@ -151,15 +152,18 @@ class DeterministicToy5GEnvAdapter:
         self._alloc.fill_(self.noop)
         self._last_transitions = []
         self._cur_layer = None
-        self._arrivals_added = False
-        self._avg_tp_before_tti = None
 
     def begin_tti(self):
         self._alloc.fill_(self.noop)
         self._last_transitions = []
         self._cur_layer = None
-        self._arrivals_added = False
-        self._avg_tp_before_tti = None
+        # UE Selection
+        selected_ues = self.ue_priority.argsort(descending=True)[:self.max_sched_ue]   
+        self.selected_ues = selected_ues
+        self.selected_buf = self.buf[selected_ues]
+        self.selected_rank = self.ue_rank[selected_ues]
+        self.selected_avg_tp = self.avg_tp[selected_ues]
+        self.selected_curr_mcs = self._curr_mcs[selected_ues]
 
     def layer_iter(self) -> Iterator[LayerContext]:
         # We yield layer contexts one by one; obs is global state + layer id encoding.
@@ -195,7 +199,6 @@ class DeterministicToy5GEnvAdapter:
 
     def compute_layer_transitions(self, layer_ctx: LayerContext) -> List[Dict]:
         """Compute rewards and package transitions for a single layer using cached obs/masks."""
-        self._ensure_tti_start()
         return self._compute_layer_transitions(
             layer=layer_ctx.layer,
             obs=layer_ctx.obs,
@@ -205,12 +208,36 @@ class DeterministicToy5GEnvAdapter:
     def finish_tti(self):
         self.t += 1
 
+        # Update ue selection priority, reset to 0 if allocated, increase 1 otherwise
+        self.ue_priority +=1
+        allocated_ue=[]
+        for u in range(self.max_sched_ue):
+            ue_id = self.selected_ues[u]
+            if (u==self._alloc).any():
+                self.ue_priority[ue_id]=0
+                allocated_ue.append(ue_id)
+        unscheduled_mask = torch.full((self.n_ue,),True, device=self.device, dtype=torch.bool)
+        unscheduled_mask[allocated_ue] = False
+  
+        # Update USER_THROUGHPUT and BUFFER STATUS at the END OF TTI
+        user_tp, remained_buf = self.user_rate_under_sinr()
+        self.selected_buf = remained_buf
+        self.selected_avg_tp = self.ema_beta * self.selected_avg_tp + (1.0 - self.ema_beta) * user_tp
+
+        # Update buffers and throughput
+        self.buf[self.selected_ues] = self.selected_buf
+        self.avg_tp[self.selected_ues] = self.selected_avg_tp
+        self.avg_tp[unscheduled_mask] = self.ema_beta * self.avg_tp[unscheduled_mask] + (1.0 - self.ema_beta) * 0.0
+
+        # Add new data to buffers for the next TTI
+        self.buf = torch.clamp(self.buf + self.buf_arrival, max=100000)
+        
     def user_rate_under_sinr(self):
         alloc = self._alloc.detach().cpu().numpy()
         noop = self.noop
-        served_bytes_ue_tti = np.zeros((self.n_ue,), dtype=np.float32)
+        served_bytes_ue_tti = np.zeros((self.max_sched_ue,), dtype=np.float32)
         duration_s = self.tti_ms / 1000.0
-        buf_tmp = self.buf.clone()
+        buf_tmp = self.selected_buf.clone()
 
         for m in range(self.n_rbg):
             # Get all unique UEs scheduled on this RBG, ignoring NOOPs.
@@ -224,7 +251,7 @@ class DeterministicToy5GEnvAdapter:
                     for j in range(i + 1, len(scheduled_ues_on_rbg)):
                         u1 = scheduled_ues_on_rbg[i]
                         u2 = scheduled_ues_on_rbg[j]
-                        corrs.append(self.max_cross_corr[u1, u2, m])
+                        corrs.append(self.max_cross_corr[self.selected_ues[u1], self.selected_ues[u2], m])
                 if corrs:
                     max_cross_corr_rbg = max(corrs)
 
@@ -235,7 +262,7 @@ class DeterministicToy5GEnvAdapter:
                 u = int(alloc[l, m].item())
                 if u == noop:
                     continue
-                tbs = self._served_bytes(u, m)
+                tbs = self._served_bytes(self.selected_ues[u], m)
                 effective_tbs = float(tbs) * penalty
                 served = min(float(buf_tmp[u].item()), float(effective_tbs))
                 buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
@@ -262,7 +289,7 @@ class DeterministicToy5GEnvAdapter:
             layer = self._cur_layer if self._cur_layer is not None else 0
 
         # valid UE if buffer > 0, NOOP always valid
-        valid_ue = (self.buf > 0.0).unsqueeze(0).expand(self.n_rbg, -1)  # [M, U]
+        valid_ue = (self.selected_buf > 0.0).unsqueeze(0).expand(self.n_rbg, -1)  # [M, U]
 
         # Rank constraint: UE rank >= total allocated layers for this RBG
         # We check: count(allocs in previous layers) < ue_rank
@@ -272,18 +299,17 @@ class DeterministicToy5GEnvAdapter:
         if layer > 0:
             # 1. Rank Check (Same as before)
             prev_allocs = self._alloc[:layer, :]
-            u_indices = torch.arange(self.n_ue, device=self.device).view(1, 1, -1)
+            u_indices = torch.arange(self.max_sched_ue, device=self.device).view(1, 1, -1)
             matches = (prev_allocs.unsqueeze(-1) == u_indices)
             counts = matches.sum(dim=0)  # [M, U]
-            rank_ok = (counts < self.ue_rank.unsqueeze(0)) 
+            rank_ok = (counts < self.selected_rank.unsqueeze(0)) 
 
-            # 2. Per-UE Continuity Check
-            # Has the UE ever been seen in this RBG before?
+            # 2. Per-UE Continuity Check. Has the UE ever been seen in this RBG before?
             ever_seen = counts > 0  # [M, U]
             
             # Was the UE in the layer immediately before this one?
             last_layer_alloc = self._alloc[layer - 1, :]
-            in_prev_layer = (last_layer_alloc.unsqueeze(-1) == torch.arange(self.n_ue, device=self.device).view(1, -1)) # [M, U]
+            in_prev_layer = (last_layer_alloc.unsqueeze(-1) == torch.arange(self.max_sched_ue, device=self.device).view(1, -1)) # [M, U]
 
             # Logic: If ever_seen is True, then in_prev_layer MUST be True.
             # If ever_seen is False, the UE is a "new starter" and is valid.
@@ -297,60 +323,59 @@ class DeterministicToy5GEnvAdapter:
 
     def _build_obs(self, layer: int) -> torch.Tensor:
         # Build structured features then pad/truncate to obs_dim.
-        # Per-UE features (7 total; last two reserved):
+
         # 1. Normalized Past Averaged Throughput [1]: avg_tp_u / max(avg_tp)
+        norm_past_avg_tp = self.selected_avg_tp / self.max_rate
+
         # 2. Normalized Rank of UE [1]: rank_u / max_ue_rank
+        norm_ue_rank = torch.clamp(self.selected_rank / float(self.max_ue_rank), 0.0, 1.0)
+
         # 3. Normalized Number of Already Allocated RBGs [1] (layers < current)
-        # 4. Normalized Downlink Buffer Status [1]: buf_u / max(buf)
-        # 5. Normalized Wideband (CQI->MCS) [1]: mcs_u / 28
-        # 6. Reserved (0)
-        # 7. Reserved (0)
-        
-        norm_past_avg_tp = self.avg_tp / self.max_rate
-
-        norm_ue_rank = torch.clamp(self.ue_rank / float(self.max_ue_rank), 0.0, 1.0)
-
         if layer > 0:
             prev_alloc = self._alloc[:layer, :]  # [L', M]
-            alloc_counts = torch.zeros((self.n_ue,), device=self.device, dtype=torch.float32)
-            for u in range(self.n_ue):
+            alloc_counts = torch.zeros((self.max_sched_ue,), device=self.device, dtype=torch.float32)
+            for u in range(self.max_sched_ue):
                 alloc_counts[u] = (prev_alloc == u).sum()
             norm_allocated_rbgs = alloc_counts / float(max(self.n_rbg, 1))
         else:
-            norm_allocated_rbgs = torch.zeros((self.n_ue,), device=self.device, dtype=torch.float32)
+            norm_allocated_rbgs = torch.zeros((self.max_sched_ue,), device=self.device, dtype=torch.float32)
 
-        max_buf = torch.clamp(self.buf.max(), min=self.eps)
-        norm_buffer = self.buf / max_buf
+        # 4. Normalized Downlink Buffer Status [1]: buf_u / max(buf)
+        max_buf = torch.clamp(self.selected_buf.max(), min=self.eps)
+        norm_buffer = self.selected_buf / max_buf
 
+        # 5. Normalized Wideband (CQI->MCS) [1]: mcs_u / 28
         if not hasattr(self, "_curr_mcs"):
             self._sample_mcs()
-        mcs = torch.tensor(self._curr_mcs, device=self.device, dtype=torch.float32)
+        mcs = torch.tensor(self.selected_curr_mcs , device=self.device, dtype=torch.float32)
         norm_wb_cqi = torch.clamp(mcs / float(self.max_mcs), 0.0, 1.0)
-        
-        norm_subband_cqi = torch.tensor(self.curr_mcs_subband, device=self.device, dtype=torch.float32) / float(self.max_mcs)
 
-        # New feature: Max Cross Correlation with previously scheduled UEs on the same RBG
-        # Shape: [n_ue, n_rbg]
-        max_corr_feat = torch.zeros((self.n_ue, self.n_rbg), device=self.device, dtype=torch.float32)
+        # 6. Normalized Subband CQI    
+        norm_subband_cqi = torch.tensor(self.curr_mcs_subband[self.selected_ues,:], device=self.device, dtype=torch.float32) / float(self.max_mcs)
+
+        # 7. Max Cross Correlation with previously scheduled UEs on the same RBG, Shape: [n_ue, n_rbg]
+        max_corr_feat = torch.zeros((self.max_sched_ue, self.n_rbg), device=self.device, dtype=torch.float32)
         if layer > 0:
             # Convert table to tensor (shape [U, U, M])
             cross_corr = torch.as_tensor(self.max_cross_corr, device=self.device, dtype=torch.float32)
             prev_alloc = self._alloc[:layer, :]  # [L', M]
+            candidate_global_ids = self.selected_ues
 
             for m in range(self.n_rbg):
                 # Identify UEs scheduled in this RBG in previous layers
-                scheduled_ues = prev_alloc[:, m]
-                valid_mask = (scheduled_ues != self.noop)
-                valid_ues = scheduled_ues[valid_mask]  # [k]
+                scheduled_ues_local = prev_alloc[:, m]
+                valid_mask = (scheduled_ues_local != self.noop)
+                valid_ues_local = scheduled_ues_local[valid_mask]  # [k] local indices
 
-                if valid_ues.numel() > 0:
-                    # For all candidate UEs (dim 0), get correlations with valid_ues (dim 1) at RBG m
-                    # cross_corr[:, valid_ues, m] -> [U, k]
-                    # Take max over the set of scheduled UEs
-                    vals, _ = cross_corr[:, valid_ues, m].max(dim=1)
+                if valid_ues_local.numel() > 0:
+                    # Map local indices to global indices
+                    scheduled_ues_global = self.selected_ues[valid_ues_local]
+
+                    # Get correlations between all candidates and already-scheduled UEs
+                    sub_corr_matrix = cross_corr[candidate_global_ids.unsqueeze(1), scheduled_ues_global.unsqueeze(0), m]
+                    vals, _ = sub_corr_matrix.max(dim=1)
                     max_corr_feat[:, m] = vals
 
-        
         ue_feats = torch.stack(
             [norm_past_avg_tp, norm_ue_rank, norm_allocated_rbgs, norm_buffer, norm_wb_cqi],
             dim=1,
@@ -381,126 +406,17 @@ class DeterministicToy5GEnvAdapter:
 
         return self._curr_mcs
 
-    def _ensure_tti_start(self):
-        if not self._arrivals_added:
-            self.buf = self.buf + self.buf_arrival
-            self._avg_tp_before_tti = self.avg_tp.clone()
-            self._arrivals_added = True
-
     def _compute_layer_transitions(self, layer: int, obs: torch.Tensor, masks: torch.Tensor) -> List[Dict]:
-        # reward computed after finishing layer allocation (across all RBGs)
-        # 1) compute instantaneous per-UE throughput for *this layer only* and accumulate
-        #    Use actually served amount (cap by remaining buffer).
-        # tp_layer = torch.zeros((self.n_ue,), device=self.device)
-        # served_layer = torch.zeros((self.n_ue,), device=self.device)
-        # served_rbg = torch.zeros((self.n_rbg,), device=self.device)
-        # buf_tmp = self.buf.clone()
-        # for m in range(self.n_rbg):
-        #     ue = int(self._alloc[layer, m].item())
-        #     if ue == self.noop:
-        #         continue
-        #     if buf_tmp[ue] <= 0:
-        #         continue  # should be masked but keep safe
-        #     served = self._served_bytes(ue,m)
-        #     served = torch.minimum(buf_tmp[ue], served)
-        #     served_rbg[m] = served
-        #     buf_tmp[ue] = torch.clamp(buf_tmp[ue] - served, min=0.0)
-        #     served_layer[ue] += served
         
-        # duration_s = self.tti_ms / 1000.0
-        # tp_layer = (served_layer * 8.0) / 1e6 / max(duration_s, 1e-9)
-
-        # 2) update EMA throughput using this layer contribution (paper says reward after each layer iteration)
-        # self.avg_tp = self.ema_beta * self.avg_tp + (1.0 - self.ema_beta) * tp_layer
-
-        # 3) Off-policy DSACD reward (paper Appendix D.4, Eq.20-21)
-        # avg_tp_before_tti = self._avg_tp_before_tti if self._avg_tp_before_tti is not None else self.avg_tp
-        # rewards_m = torch.empty((self.n_rbg,), device=self.device)
-        # for m in range(self.n_rbg):
-        #     chosen = int(self._alloc[layer, m].item())
-
-        #     # Identify UEs scheduled in previous layers on this RBG
-        #     scheduled_ues = []
-        #     if layer > 0:
-        #         prev_alloc = self._alloc[:layer, m]
-        #         for l_prev in range(layer):
-        #             u_prev = int(prev_alloc[l_prev].item())
-        #             if u_prev != self.noop:
-        #                 scheduled_ues.append(u_prev)
-
-        #     raw_all = torch.empty((self.n_ue,), device=self.device, dtype=torch.float32)
-        #     for u in range(self.n_ue):
-        #         if self.buf[u] <= 0:
-        #             raw_all[u] = 0.0
-        #             continue
-
-        #         Ru = float((avg_tp_before_tti[u] + self.eps).item())
-        #         Tu = float(self._rate_mbps(u,m).item())
-
-        #         # Apply spatial interference penalty: Tu *= (1 - max_cross_corr)
-        #         penalty = 0.0
-        #         if len(scheduled_ues) > 0:
-        #             # max_cross_corr is [U, U, M]. Get max corr with any scheduled UE on this RBG.
-        #             corrs = [self.max_cross_corr[u, v, m] for v in scheduled_ues]
-        #             penalty = max(corrs)
-                
-        #         Tu = Tu * (1.0 - penalty)
-
-        #         if layer == 0:
-        #             raw_all[u] = Tu / Ru
-        #         else:
-        #             prev = int(self._alloc[layer - 1, m].item())
-        #             Tu_prev = Tu if (prev == u) else 0.0
-        #             raw_all[u] = (Tu / Ru) - (Tu_prev / Ru)
-
-        #     max_raw = float(raw_all.max().item()) if raw_all.numel() > 0 else 0.0
-
-        #     if max_raw > 0.0:
-        #         if chosen == self.noop:
-        #             rewards_m[m] = 0.0
-        #         else:
-        #             u = int(chosen)
-        #             # chosen might be invalid if buf==0; keep safe
-        #             if u < 0 or u >= self.n_ue or self.buf[u] <= 0:
-        #                 rewards_m[m] = 0.0
-        #             else:
-        #                 raw = float(raw_all[u].item())
-        #                 rewards_m[m] = max(raw / max_raw, -1.0)
-        #     elif max_raw < 0.0:
-        #         rewards_m[m] = 1.0 if (chosen == self.noop) else -1.0
-        #     else:
-        #         rewards_m[m] = 0.0
-
+        # Calculating reward for current layer
         rewards_m, _ = new_reward_compute(self, layer, masks)
         
-        # if(self.internal_log):
-        #   print("Appling actions on environment ....")
-        #   print(f"served_rbg:{served_rbg}\nserved_layer:{served_layer}")
-        #   print(f"Rewards:{rewards_m}")
-
-        # 5) Apply service (drain buffers) for this layer after reward computation
-        # for m in range(self.n_rbg):
-        #     ue = int(self._alloc[layer, m].item())
-        #     if ue == self.noop:
-        #         continue
-        #     served = served_rbg[m]
-        #     self.buf[ue] = torch.clamp(self.buf[ue] - served, min=0.0)
-
-        # next state after this layer
+        # Generating next observations
         if(self.internal_log):
           print("Next obesrvation:")
         next_layer_idx = min(layer + 1, self.n_layers - 1)
         next_masks = self._build_masks(layer=next_layer_idx)
         next_obs = self._build_obs(layer=next_layer_idx)
-
-        # Update USER_THROUGHPUT and BUFFER STATUS at the END OF TTI
-        if layer == self.n_layers - 1:
-
-            user_tp, remained_buf = self.user_rate_under_sinr()
-            self.avg_tp = self.ema_beta * self.avg_tp + (1.0 - self.ema_beta) * user_tp
-
-            # Update buffer after service
-            self.buf = remained_buf
 
         out = []
         for m in range(self.n_rbg):
@@ -527,25 +443,24 @@ def compute_set_tput(self, alloc_set, m):
             v = alloc_set[j]
             max_corr = max(
                 max_corr,
-                float(self.max_cross_corr[u, v, m].item())
+                float(self.max_cross_corr[self.selected_ues[u], self.selected_ues[v], m].item())
             )
 
     penalty = (1.0 - max_corr) / max(len(alloc_set), 1)
 
     tput = 0.0
     for u in alloc_set:
-        if self.buf[u] > 0:
-            tput += float(self._rate_mbps(u, m).item())
+        if self.selected_buf[u] > 0:
+            tput += float(self._rate_mbps(self.selected_ues[u], m).item())
 
-    return tput * penalty    
+    return tput * penalty
 
 def new_reward_compute(self, layer: int, masks: torch.Tensor):
     rewards_m = torch.zeros((self.n_rbg,), device=self.device)
     set_tp_per_rbg = torch.zeros((self.n_rbg,), device=self.device)
     noop = self.noop
-    U = self.n_ue
 
-    Ru_all = self._avg_tp_before_tti.clone()  # [U]
+    Ru_all = self.selected_buf.clone()
 
     for m in range(self.n_rbg):
         # ---------- previous set ----------
@@ -563,10 +478,10 @@ def new_reward_compute(self, layer: int, masks: torch.Tensor):
         if chosen == noop:
             set_tp_per_rbg[m] = T_prev
 
-        raw_all = torch.zeros((U,), device=self.device)
+        raw_all = torch.zeros((self.max_sched_ue,), device=self.device)
 
-        for u in range(U):
-            if not masks[m, u] or self.buf[u] <= 0:
+        for u in range(self.max_sched_ue):
+            if not masks[m, u] or self.selected_buf[u] <= 0:
                 continue
 
             curr_alloc = prev_alloc + [u]
