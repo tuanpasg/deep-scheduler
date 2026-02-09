@@ -534,19 +534,19 @@ def main(args):
             append_eval(eval_log, "random", tti, m_rand)
 
             msg += (
-                f" \nSAMPLE cell_tput={m_sample['avg_cell_tput[Mbps]']:.2f}"
+                f" \nSAMPLE cell_tput[Mbps]={m_sample['avg_cell_tput']:.2f}"
                 f" jain={m_sample['jain_throughput']:.3f}"
                 f" pfU={m_sample['pf_utility']:.2f}"
                 f" inv={m_sample['invalid_action_rate']:.3f}"
                 f" noop={m_sample['no_schedule_rate']:.3f}"
                 f" layers/RBG={m_sample['avg_layers_per_rbg']:.2f}"
-                f" \nGREEDY cell_tput={m_greedy['avg_cell_tput[Mbps]']:.2f}"
+                f" \nGREEDY cell_tput[Mbps]={m_greedy['avg_cell_tput']:.2f}"
                 f" jain={m_greedy['jain_throughput']:.3f}"
                 f" pfU={m_greedy['pf_utility']:.2f}"
                 f" inv={m_greedy['invalid_action_rate']:.3f}"
                 f" noop={m_greedy['no_schedule_rate']:.3f}"
                 f" layers/RBG={m_greedy['avg_layers_per_rbg']:.2f}"
-                f" \nRANDOM cell_tput={m_rand['avg_cell_tput[Mbps]']:.2f}"
+                f" \nRANDOM cell_tput[Mbps]={m_rand['avg_cell_tput']:.2f}"
                 f" jain={m_rand['jain_throughput']:.3f}"
                 f" pfU={m_rand['pf_utility']:.2f}"
                 f" inv={m_rand['invalid_action_rate']:.3f}"

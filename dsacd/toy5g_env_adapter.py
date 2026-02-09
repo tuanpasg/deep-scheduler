@@ -129,9 +129,9 @@ class DeterministicToy5GEnvAdapter:
 
         # Fading profile: fixed per-UE MCS mean (constant through layers/RBGs)
         self.rng = np.random.default_rng(seed)
-        # self.mcs_mean = self.rng.integers(0, self.max_mcs + 1, size=(self.n_ue,))
+        self.mcs_mean = self.rng.integers(0, self.max_mcs + 1, size=(self.n_ue,))
         # self.mcs_mean = np.full((self.n_ue,), 20, dtype=int)
-        self.mcs_mean = np.array([5,10,25,5])
+        # self.mcs_mean = np.array([5,10,25,5])
         self.mcs_spread = 1
 
         self.internal_log = internal_log
@@ -545,7 +545,7 @@ def new_reward_compute(self, layer: int, masks: torch.Tensor):
     noop = self.noop
     U = self.n_ue
 
-    Ru_all = self.avg_tp_before_tti  # [U]
+    Ru_all = self._avg_tp_before_tti.clone()  # [U]
 
     for m in range(self.n_rbg):
         # ---------- previous set ----------
@@ -591,4 +591,11 @@ def new_reward_compute(self, layer: int, masks: torch.Tensor):
             rewards_m[m] = 1.0 if chosen == noop else -1.0
         else:
             rewards_m[m] = 0.0
+            
+        if self._internal_log:
+            print(f"Computing reward for rgb {m} ....")
+            print(f"prev_alloc={prev_alloc}, T_prev={T_prev}")
+            print(f"chosen={chosen}, T_cur={set_tp_per_rbg[m]}")
+            print(f"raw_all={raw_all}")
+            print(f"rewards_m={rewards_m}")
     return rewards_m, set_tp_per_rbg
