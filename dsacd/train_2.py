@@ -36,6 +36,50 @@ def _jain_fairness(x: torch.Tensor, eps: float = 1e-12) -> float:
     den = float(x.numel()) * float((x * x).sum().item()) + eps
     return num / den
 
+def ue_rate_under_sinr(eval_env: DeterministicToy5GEnvAdapter):
+    noop = eval_env.noop
+    alloc = eval_env._alloc.detach().cpu()
+    selected_ues = eval_env.selected_ues
+    served = torch.zeros((eval_env.n_ue,),dtype=torch.float32)
+    alloc_counts = torch.zeros((eval_env.n_ue,),dtype=torch.float32)
+    duration_s = eval_env.tti_ms / 1000.0
+    for m in range(eval_env.n_rbg):
+        # Get all unique UEs scheduled on this RBG, ignoring NOOPs.
+        scheduled_ues_on_rbg = sorted(list(set(u for u in alloc[:, m].tolist() if u != noop)))
+
+        # Find the maximum cross-correlation between any pair of UEs on this RBG
+        max_cross_corr_rbg = 0.0
+        if len(scheduled_ues_on_rbg) > 1:
+            corrs = []
+            for i in range(len(scheduled_ues_on_rbg)):
+                for j in range(i + 1, len(scheduled_ues_on_rbg)):
+                    u1 = scheduled_ues_on_rbg[i]
+                    u2 = scheduled_ues_on_rbg[j]
+                    # CRITICAL FIX: max_cross_corr is [U, U, M], requires RBG index 'm'
+                    corrs.append(eval_env.max_cross_corr[selected_ues[u1], selected_ues[u2], m])
+            if corrs:
+                max_cross_corr_rbg = max(corrs)
+
+        # LOGIC FIX: The penalty should model interference, not divide the resource.
+        # The original division by scheduled_layers_rbg incorrectly assumes total
+        # throughput is constant, which defeats the purpose of MU-MIMO.
+        penalty = 1.0 - max_cross_corr_rbg
+
+        scheduled_layers_rbg = len([u for u in alloc[:, m].tolist() if u != noop])
+        for l in range(L):
+            u = int(alloc[l, m].item())
+            if u == noop:
+                continue
+            global_ue_id = selected_ues[u]
+            tbs = eval_env._served_bytes(global_ue_id,m)
+            # In full buffer traffic mode, the served bytes will be not contrained by the buffer size
+            served[global_ue_id] = float(tbs)*penalty
+            alloc_counts[global_ue_id] += 1.0
+
+        layers_per_rbg_sum += float(scheduled_layers_rbg)
+        layers_per_rbg_den += 1
+    ue_tti = float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
+    return ue_tti, layers_per_rbg_sum, layers_per_rbg_den
 
 @torch.no_grad()
 def evaluate_scheduler_metrics(
@@ -112,52 +156,7 @@ def evaluate_scheduler_metrics(
             eval_env.compute_layer_transitions(layer_ctx)
 
         # After all layers, env._alloc holds the chosen schedule for this TTI
-        alloc = eval_env._alloc.detach().cpu()  # [L, M]
-        ue_tti = torch.zeros((U,), dtype=torch.float32)
-
-        if not hasattr(eval_env, "_curr_mcs"):
-            eval_env._sample_mcs()
-        mcs = np.asarray(eval_env._curr_mcs, dtype=int)
-        # buf_tmp = eval_env.buf.detach().cpu().clone() + float(eval_env.buf_arrival)
-        duration_s = eval_env.tti_ms / 1000.0
-
-        # pairing metric per RBG
-        for m in range(M):
-            # Get all unique UEs scheduled on this RBG, ignoring NOOPs.
-            scheduled_ues_on_rbg = sorted(list(set(u for u in alloc[:, m].tolist() if u != noop)))
-
-            # Find the maximum cross-correlation between any pair of UEs on this RBG
-            max_cross_corr_rbg = 0.0
-            if len(scheduled_ues_on_rbg) > 1:
-                corrs = []
-                for i in range(len(scheduled_ues_on_rbg)):
-                    for j in range(i + 1, len(scheduled_ues_on_rbg)):
-                        u1 = scheduled_ues_on_rbg[i]
-                        u2 = scheduled_ues_on_rbg[j]
-                        # CRITICAL FIX: max_cross_corr is [U, U, M], requires RBG index 'm'
-                        corrs.append(eval_env.max_cross_corr[u1, u2, m])
-                if corrs:
-                    max_cross_corr_rbg = max(corrs)
-
-            # LOGIC FIX: The penalty should model interference, not divide the resource.
-            # The original division by scheduled_layers_rbg incorrectly assumes total
-            # throughput is constant, which defeats the purpose of MU-MIMO.
-            penalty = 1.0 - max_cross_corr_rbg
-
-            scheduled_layers_rbg = len([u for u in alloc[:, m].tolist() if u != noop])
-            for l in range(L):
-                u = int(alloc[l, m].item())
-                if u == noop:
-                    continue
-                tbs = eval_env._served_bytes(u,m)
-                # In full buffer traffic mode, the served bytes will be not contrained by the buffer size
-                served = float(tbs)*penalty
-                # served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
-                # buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
-                ue_tti[u] += float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
-                alloc_counts[u] += 1.0
-            layers_per_rbg_sum += float(scheduled_layers_rbg)
-            layers_per_rbg_den += 1
+        ue_tti, layers_per_rbg_sum, layers_per_rbg_den = ue_rate_under_sinr(eval_env)
 
         total_ue_tput += ue_tti
         total_cell_tput += float(ue_tti.sum().item())
@@ -244,52 +243,7 @@ def evaluate_random_scheduler_metrics(
             eval_env.apply_layer_actions(layer_ctx, actions)
             eval_env.compute_layer_transitions(layer_ctx)
 
-        alloc = eval_env._alloc.detach().cpu()  # [L, M]
-        ue_tti = torch.zeros((U,), dtype=torch.float32)
-
-        if not hasattr(eval_env, "_curr_mcs"):
-            eval_env._sample_mcs()
-        mcs = np.asarray(eval_env._curr_mcs, dtype=int)
-        # buf_tmp = eval_env.buf.detach().cpu().clone() + float(eval_env.buf_arrival)
-        duration_s = eval_env.tti_ms / 1000.0
-
-        for m in range(M):
-            # Get all unique UEs scheduled on this RBG, ignoring NOOPs.
-            scheduled_ues_on_rbg = sorted(list(set(u for u in alloc[:, m].tolist() if u != noop)))
-
-            # Find the maximum cross-correlation between any pair of UEs on this RBG
-            max_cross_corr_rbg = 0.0
-            if len(scheduled_ues_on_rbg) > 1:
-                corrs = []
-                for i in range(len(scheduled_ues_on_rbg)):
-                    for j in range(i + 1, len(scheduled_ues_on_rbg)):
-                        u1 = scheduled_ues_on_rbg[i]
-                        u2 = scheduled_ues_on_rbg[j]
-                        # CRITICAL FIX: max_cross_corr is [U, U, M], requires RBG index 'm'
-                        corrs.append(eval_env.max_cross_corr[u1, u2, m])
-                if corrs:
-                    max_cross_corr_rbg = max(corrs)
-
-            # LOGIC FIX: The penalty should model interference, not divide the resource.
-            # The original division by scheduled_layers_rbg incorrectly assumes total
-            # throughput is constant, which defeats the purpose of MU-MIMO.
-            penalty = 1.0 - max_cross_corr_rbg
-
-            scheduled_layers_rbg = len([u for u in alloc[:, m].tolist() if u != noop])   
-            for l in range(L):
-                u = int(alloc[l, m].item())
-                if u == noop:
-                    continue
-                tbs = eval_env._served_bytes(u,m)
-                # In full buffer traffic mode, the served bytes will be not contrained by the buffer size
-                served = float(tbs)*penalty
-                # served = min(float(buf_tmp[u].item()), float(tbs)) * penalty
-                # buf_tmp[u] = max(0.0, float(buf_tmp[u].item()) - served)
-                ue_tti[u] += float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
-                alloc_counts[u] += 1.0
-
-            layers_per_rbg_sum += float(scheduled_layers_rbg)
-            layers_per_rbg_den += 1
+        ue_tti, layers_per_rbg_sum, layers_per_rbg_den = ue_rate_under_sinr(eval_env)
 
         total_ue_tput += ue_tti
         total_cell_tput += float(ue_tti.sum().item())
