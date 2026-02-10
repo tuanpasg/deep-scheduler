@@ -275,8 +275,8 @@ def evaluate_random_scheduler_metrics(
         "total_cell_tput": float(total_cell_tput),
         "total_ue_tput": total_ue_tput,
         "avg_cell_tput": avg_cell_tput,
-        "avg_ue_tput": alloc_counts_per_tti,
-        "alloc_counts": alloc_counts,
+        "avg_ue_tput": avg_ue_tput,
+        "alloc_counts": alloc_counts_per_tti,
         "jain_throughput": float(jain_throughput),
         "pf_utility": float(pf_utility),
         "invalid_action_rate": float(invalid_action_rate),
@@ -350,8 +350,8 @@ def main(args):
     device = torch.device(args.device)
 
     env = DeterministicToy5GEnvAdapter(
-        obs_dim=args.obs_dim,
-        act_dim=args.act_dim,
+        n_ue=args.n_cell_ue,
+        max_sched_ue=args.max_sched_ue,
         n_layers=args.n_layers,
         n_rbg=args.n_rbg,
         device=args.device,
@@ -363,8 +363,8 @@ def main(args):
     args.act_dim = env.act_dim
 
     eval_env = DeterministicToy5GEnvAdapter(
-        obs_dim=args.obs_dim,
-        act_dim=args.act_dim,
+        n_ue=args.n_cell_ue,
+        max_sched_ue=args.max_sched_ue,
         n_layers=args.n_layers,
         n_rbg=args.n_rbg,
         device=args.device,
@@ -533,6 +533,8 @@ if __name__ == "__main__":
 
     p.add_argument("--obs_dim", type=int, default=164)
     p.add_argument("--act_dim", type=int, default=5)
+    p.add_argument("--n_cell_ue", type=int, default=512)
+    p.add_argument("--max_sched_ue", type=int, default=64)
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--n_rbg", type=int, default=18)
     p.add_argument("--fallback_action", type=int, default=0)

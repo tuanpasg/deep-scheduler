@@ -67,8 +67,8 @@ class DeterministicToy5GEnvAdapter:
 
     def __init__(
         self,
-        obs_dim: int,
-        act_dim: int,
+        n_ue: int,
+        max_sched_ue: int,
         n_layers: int,
         n_rbg: int,
         *,
@@ -86,9 +86,9 @@ class DeterministicToy5GEnvAdapter:
         overhead_re_per_prb: int = 18,
         internal_log: bool = False
     ):
-        assert act_dim >= 2, "Need at least 1 UE + NOOP."
-        self.n_ue = 512
-        self.max_sched_ue = 10
+        assert max_sched_ue >= 1, "Need at least 1 UE + NOOP."
+        self.n_ue = n_ue
+        self.max_sched_ue = max_sched_ue
         self.noop = self.max_sched_ue
         self.n_layers = n_layers
         self.n_rbg = n_rbg
@@ -96,6 +96,9 @@ class DeterministicToy5GEnvAdapter:
         self.act_dim = self.max_sched_ue + 1
         self.obs_dim = (5+2*self.n_rbg)*self.max_sched_ue
 
+        print(f"OBSERVATION SIZE: {self.obs_dim}")
+        print(f"ACTION SIZE: {self.act_dim}")
+        
         self.device = torch.device(device)
 
         self.max_mcs = 28  # max MCS index (0..28)
