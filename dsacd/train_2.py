@@ -43,6 +43,9 @@ def ue_rate_under_sinr(eval_env: DeterministicToy5GEnvAdapter):
     served = torch.zeros((eval_env.n_ue,),dtype=torch.float32)
     alloc_counts = torch.zeros((eval_env.n_ue,),dtype=torch.float32)
     duration_s = eval_env.tti_ms / 1000.0
+    layers_per_rbg_sum = 0.0
+    layers_per_rbg_den = 0
+
     for m in range(eval_env.n_rbg):
         # Get all unique UEs scheduled on this RBG, ignoring NOOPs.
         scheduled_ues_on_rbg = sorted(list(set(u for u in alloc[:, m].tolist() if u != noop)))
@@ -66,7 +69,10 @@ def ue_rate_under_sinr(eval_env: DeterministicToy5GEnvAdapter):
         penalty = 1.0 - max_cross_corr_rbg
 
         scheduled_layers_rbg = len([u for u in alloc[:, m].tolist() if u != noop])
-        for l in range(L):
+        layers_per_rbg_sum += float(scheduled_layers_rbg)
+        layers_per_rbg_den += 1
+
+        for l in range(eval_env.n_layers):
             u = int(alloc[l, m].item())
             if u == noop:
                 continue
@@ -76,10 +82,9 @@ def ue_rate_under_sinr(eval_env: DeterministicToy5GEnvAdapter):
             served[global_ue_id] = float(tbs)*penalty
             alloc_counts[global_ue_id] += 1.0
 
-        layers_per_rbg_sum += float(scheduled_layers_rbg)
-        layers_per_rbg_den += 1
     ue_tti = float((served * 8.0) / 1e6 / max(duration_s, 1e-9))
-    return ue_tti, layers_per_rbg_sum, layers_per_rbg_den
+    avg_layers_per_rbg = layers_per_rbg_sum / max(layers_per_rbg_den, 1)
+    return ue_tti, avg_layers_per_rbg
 
 @torch.no_grad()
 def evaluate_scheduler_metrics(
@@ -119,14 +124,13 @@ def evaluate_scheduler_metrics(
     total_cell_tput = 0.0
     total_ue_tput = torch.zeros((U,), dtype=torch.float32)
     alloc_counts = torch.zeros((U,), dtype=torch.float32)
+    total_layers_per_rbg = 0.0
 
     invalid = 0
     nosched = 0
     decisions = 0
 
     # pairing metric: average number of layers scheduled per RBG
-    layers_per_rbg_sum = 0.0
-    layers_per_rbg_den = 0
 
     for _ in range(eval_ttis):
         eval_env.begin_tti()
@@ -156,8 +160,10 @@ def evaluate_scheduler_metrics(
             eval_env.compute_layer_transitions(layer_ctx)
 
         # After all layers, env._alloc holds the chosen schedule for this TTI
-        ue_tti, layers_per_rbg_sum, layers_per_rbg_den = ue_rate_under_sinr(eval_env)
+        ue_tti, avg_layers_per_rbg = ue_rate_under_sinr(eval_env)
 
+        
+        total_layers_per_rbg += avg_layers_per_rbg
         total_ue_tput += ue_tti
         total_cell_tput += float(ue_tti.sum().item())
 
@@ -168,7 +174,8 @@ def evaluate_scheduler_metrics(
 
     invalid_action_rate = invalid / max(decisions, 1)
     no_schedule_rate = nosched / max(decisions, 1)
-    avg_layers_per_rbg = layers_per_rbg_sum / max(layers_per_rbg_den, 1)
+    avg_layers_per_rbg = total_layers_per_rbg / eval_ttis
+
 
     jain_throughput = _jain_fairness(total_ue_tput)
     pf_utility = float(torch.log((avg_ue_tput) + eps).sum().item())
