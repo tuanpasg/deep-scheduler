@@ -140,7 +140,7 @@ class DeterministicToy5GEnvAdapter:
         self.mcs_spread = 1
 
         self.internal_log = internal_log
-
+        print(f"Initial mcs: {self.mcs_mean}")
         # Pseudo cross correlation table
         self.max_cross_corr = np.random.rand(self.n_ue, self.n_ue, self.n_rbg)
         self.max_cross_corr = (self.max_cross_corr + self.max_cross_corr.transpose(1, 0, 2)) / 2
@@ -163,7 +163,8 @@ class DeterministicToy5GEnvAdapter:
         self._last_transitions = []
         self._cur_layer = None
         # UE Selection
-        selected_ues = self.ue_priority.argsort(descending=True)[:self.max_sched_ue]   
+        # selected_ues = self.ue_priority.argsort(descending=True)[:self.max_sched_ue]
+        selected_ues = torch.arange(self.max_sched_ue)   
         self.selected_ues = selected_ues
         self.selected_buf = self.buf[selected_ues]
         self.selected_rank = self.ue_rank[selected_ues]
@@ -465,7 +466,7 @@ class DeterministicToy5GEnvAdapter:
         set_tp_per_rbg = torch.zeros((self.n_rbg,), device=self.device)
         noop = self.noop
 
-        Ru_all = self.selected_buf.clone()
+        Ru_all = self.selected_avg_tp.clone()
 
         for m in range(self.n_rbg):
             # ---------- previous set ----------

@@ -79,7 +79,7 @@ def ue_rate_under_sinr(eval_env: DeterministicToy5GEnvAdapter):
             global_ue_id = selected_ues[u]
             tbs = eval_env._served_bytes(global_ue_id,m)
             # In full buffer traffic mode, the served bytes will be not contrained by the buffer size
-            served[global_ue_id] = float(tbs)*penalty
+            served[global_ue_id] += float(tbs)*penalty
             alloc_counts[global_ue_id] += 1.0
 
     ue_tti = (served * 8.0) / 1e6 / max(duration_s, 1e-9)
@@ -423,7 +423,6 @@ def main(args):
                 device=device,
                 fallback_action=args.fallback_action,
             )
-
             env.apply_layer_actions(layer_ctx, actions_rbg)
             # print(f"LAYER ID: {layer_ctx.layer}")
             # print(f"ACTIONS: {actions_rbg}")
@@ -533,11 +532,11 @@ if __name__ == "__main__":
 
     p.add_argument("--obs_dim", type=int, default=164)
     p.add_argument("--act_dim", type=int, default=5)
-    p.add_argument("--n_cell_ue", type=int, default=512)
-    p.add_argument("--max_sched_ue", type=int, default=64)
+    p.add_argument("--n_cell_ue", type=int, default=4)
+    p.add_argument("--max_sched_ue", type=int, default=4)
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--n_rbg", type=int, default=18)
-    p.add_argument("--fallback_action", type=int, default=0)
+    p.add_argument("--fallback_action", type=int, default=-1)
 
     p.add_argument("--rb_capacity", type=int, default=72000)
     p.add_argument("--batch_size", type=int, default=64)
@@ -552,8 +551,8 @@ if __name__ == "__main__":
     p.add_argument("--lr_critic", type=float, default=1e-4)
     p.add_argument("--lr_alpha", type=float, default=1e-4)
 
-    p.add_argument("--eval_every", type=int, default=30)
-    p.add_argument("--eval_ttis", type=int, default=30)
+    p.add_argument("--eval_every", type=int, default=20)
+    p.add_argument("--eval_ttis", type=int, default=20)
     p.add_argument("--out_dir", type=str, default=os.path.join("outputs", "train_2"))
 
     args = p.parse_args()
